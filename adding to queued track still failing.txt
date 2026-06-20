@@ -1,0 +1,24 @@
+Nice to have:
+Lyrics service | local storage | Mongo
+Implement tags
+Mixing provider | Track Transitions?
+Track level equalizer config
+
+Bugs:
+border radius on progress bar
+album and track refresh? On album page
+FE retry logic -> scroll position
+search bar transaparent cancel button
+so icy -> 2 disc | fix duration pill
+test reorder queued playlist
+
+Needs download:
+jalil beats im a boss
+glasses malone
+little black submarine
+peggy gou
+ice spice
+dj quick
+yame
+big sis
+life of pablo
