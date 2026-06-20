@@ -55,3 +55,11 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Custom
+build/
+packages/
+publish/
+tasks.txt
+.gitignore
+.vs/
