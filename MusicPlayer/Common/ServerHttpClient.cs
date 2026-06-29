@@ -17,6 +17,8 @@ namespace MusicPlayer.Common
         private const string STOP_PLAYLIST_INFORMATION = "Broadcast/StopPlaylistUpdates";
         private const string START_MAPPING_INFORMATION = "Broadcast/StartMappingUpdates";
         private const string STOP_MAPPING_INFORMATION = "Broadcast/StopMappingUpdates";
+        private const string START_SERVER_STATUS_UPDATES = "Broadcast/StartServerUpdates";
+        private const string STOP_SERVER_STATUS_UPDATES = "Broadcast/StopServerUpdates";
         private const string POST_TRACK_USER_DATA = "MetaData/UpdateTrackUserData";
         private const string POST_LOG_ENTRY = "Logging/LogEntry";
 
@@ -184,6 +186,46 @@ namespace MusicPlayer.Common
                 {
                     Severity = Severity.Error,
                     Source = "UpdateTrackerUserDataAsync",
+                    Line = ex.Message,
+                    TimeStamp = DateTime.Now,
+                    Exception = ex
+                });
+                Console.WriteLine(ex.Message);
+            }
+        }
+
+        public async Task StartServerStatusUpdatesAsync()
+        {
+            try
+            {
+                await _httpClient.PostAsync($"api/{START_SERVER_STATUS_UPDATES}", null);
+            }
+            catch (Exception ex)
+            {
+                await LogEntryAsync(new LogEntry
+                {
+                    Severity = Severity.Error,
+                    Source = "StartServerStatusUpdatesAsync",
+                    Line = ex.Message,
+                    TimeStamp = DateTime.Now,
+                    Exception = ex
+                });
+                Console.WriteLine(ex.Message);
+            }
+        }
+
+        public async Task StopServerStatusUpdatesAsync()
+        {
+            try
+            {
+                await _httpClient.PostAsync($"api/{STOP_SERVER_STATUS_UPDATES}", null);
+            }
+            catch (Exception ex)
+            {
+                await LogEntryAsync(new LogEntry
+                {
+                    Severity = Severity.Error,
+                    Source = "StopServerStatusUpdatesAsync",
                     Line = ex.Message,
                     TimeStamp = DateTime.Now,
                     Exception = ex

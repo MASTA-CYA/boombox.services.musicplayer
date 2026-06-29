@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 
 namespace MusicPlayer.Extensions
@@ -38,5 +39,7 @@ namespace MusicPlayer.Extensions
                 list[length] = value;
             }
         }
+
+        public static void ToConcurrentBag<T>(this IList<T> list) => new ConcurrentBag<T>(list);
     }
 }

@@ -276,31 +276,34 @@ namespace MusicPlayer.Player
             try
             {
                 var trackPath = (_playlistProvider.CurrentProvider as EnhancedAudioFileReader).OriginalFilePath;
+                var existingPreset = await MongoDbClient.Instance.GetEqualizerPresetAsync(trackPath);
+
+                if (existingPreset != null)
+                {
+                    existingPreset.FrequencyBands = preset.FrequencyBands;
+                    await MongoDbClient.Instance.UpdateEqualizerPresetAsync(existingPreset);
+                    return;
+                }
+
                 var albumPath = Path.GetDirectoryName(trackPath);
                 var album = await MongoDbClient.Instance.GetAlbumAsync(albumPath);
                 var track = album.Tracks.Find(filteredTrack => string.Equals(filteredTrack.Path, trackPath));
 
-                if (track.EqualizerGuid == Guid.Empty)
-                {
-                    preset.Id = MongoDB.Bson.ObjectId.Empty;
-                    preset.Guid = Guid.NewGuid();
-                    preset.Name = trackPath;
-                    await MongoDbClient.Instance.InsertEqualizerPresetAsync(preset);
-                }
-                else
-                {
-                    await MongoDbClient.Instance.UpdateEqualizerPresetAsync(preset);
-                }
+                preset.Id = MongoDB.Bson.ObjectId.Empty;
+                preset.Guid = Guid.NewGuid();
+                preset.Name = trackPath;
+                preset.IsDefault = false;
+                await MongoDbClient.Instance.InsertEqualizerPresetAsync(preset);
 
-                if (track.EqualizerGuid == null) track.EqualizerGuid = preset.Guid;
+                track.EqualizerGuid = preset.Guid;
                 await MongoDbClient.Instance.UpdateAlbumAsync(album);
 
-                var albumFile = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN).FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), album.Guid));
+                var albumFile = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN).FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), album.Guid.ToString()));
                 var albumFileContent = FileManager.Instance.Read(albumFile);
                 var cachedAlbum = JsonConvert.DeserializeObject<Album>(albumFileContent, settings: JsonSerializationHelper.FileSerializerSettings);
                 var cachedTrack = cachedAlbum.Tracks.Find(filteredTrack => string.Equals(filteredTrack.Path, trackPath));
                 cachedTrack.EqualizerGuid = track.EqualizerGuid;
-                FileManager.Instance.Write(album);
+                FileManager.Instance.Write(cachedAlbum);
             }
             catch (Exception ex)
             {

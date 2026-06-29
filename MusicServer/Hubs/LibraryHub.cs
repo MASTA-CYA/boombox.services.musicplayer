@@ -63,7 +63,7 @@ namespace MusicServer.Hubs
             {
                 var path = await RedisCache.GetAsync("SelectedAlbum");
                 var album = await MongoDbClient.Instance.GetAlbumAsync(path);
-                var filePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN);
+                var filePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
                 var appDataFilePath = filePaths.FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), album.Guid.ToString()));
                 var fileJson = FileManager.Instance.Read(appDataFilePath);
                 var cachedAlbum = JsonConvert.DeserializeObject<Album>(fileJson, settings: JsonSerializationHelper.FileSerializerSettings);
@@ -101,8 +101,7 @@ namespace MusicServer.Hubs
         #region Private Methods
         private static async Task<string> GetLibraryResponseAsync()
         {
-            var libraryManager = LibraryManager.Instance;
-            var library = await libraryManager.GetAlbumsAsync().ConfigureAwait(false);
+            var library = await LibraryManager.Instance.GetAlbumsAsync().ConfigureAwait(false);
             return JsonConvert.SerializeObject(library, JsonSerializationHelper.NamingSerializerSettings);
         }
 
@@ -149,7 +148,7 @@ namespace MusicServer.Hubs
             try
             {
                 ConcurrentBag<Album> albums = [];
-                var filepaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN);
+                var filepaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
                 LibraryManager.Instance.MappingUpdate.DirectoryCount = filepaths.Count;
                 await Parallel.ForEachAsync(filepaths, async (file, token) =>
                 {

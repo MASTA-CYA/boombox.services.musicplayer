@@ -12,16 +12,18 @@ namespace MusicServer.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    public class BroadcastController(ILogger<BroadcastController> logger, IHubContext<PlayerHub> playerHub, IHubContext<PlaylistHub> playlistHub, IHubContext<LibraryHub> libraryHub) : ControllerBase
+    public class BroadcastController(ILogger<BroadcastController> logger, IHubContext<PlayerHub> playerHub, IHubContext<PlaylistHub> playlistHub, IHubContext<LibraryHub> libraryHub, IHubContext<ServerHub> serverHub) : ControllerBase
     {
         private readonly ILogger<BroadcastController> _logger = logger;
         private readonly IHubContext<PlayerHub> _playerHub = playerHub;
         private readonly IHubContext<PlaylistHub> _playlistHub = playlistHub;
         private readonly IHubContext<LibraryHub> _libraryHub = libraryHub;
+        private readonly IHubContext<ServerHub> _serverHub = serverHub;
 
         private static CancellationTokenSource? _playbackToken;
         private static CancellationTokenSource? _playlistToken;
         private static CancellationTokenSource? _libraryToken;
+        private static CancellationTokenSource? _serverToken;
 
         #region Playback Information
         [HttpPost("StartPlaybackInformation")]
@@ -170,5 +172,44 @@ namespace MusicServer.Controllers
         }
 
         #endregion Library Mapping
+
+        #region Server Updates
+        [HttpPost("StartServerUpdates")]
+        public void StartServerUpdates()
+        {
+            if (_serverToken != null) return;
+
+            _serverToken = new CancellationTokenSource();
+            var token = _serverToken.Token;
+
+            Task.Run(async () => await StartSeverStatusBroadcastAsync(token), token);
+        }
+
+        [HttpPost("StopServerUpdates")]
+        public void StopServerUpdates()
+        {
+            if (_serverToken == null) return;
+
+            _serverToken.Cancel();
+            _serverToken.Dispose();
+            _serverToken = null;
+        }
+
+        private async Task StartSeverStatusBroadcastAsync(CancellationToken token)
+        {
+            using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
+            try
+            {
+                while (await timer.WaitForNextTickAsync(token))
+                    await _serverHub.Clients.All.SendAsync("ReceiveServerUpdates", null, token);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex.Message);
+                Console.WriteLine();
+            }
+        }
+
+        #endregion Server Updates
     }
 }

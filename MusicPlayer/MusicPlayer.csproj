@@ -232,6 +232,7 @@
     <Compile Include="LibraryManagement\Models\Track.cs" />
     <Compile Include="LibraryManagement\Models\TrackUserData.cs" />
     <Compile Include="AutoScrollManagement\ScrollManager.cs" />
+    <Compile Include="LibraryManagement\Models\UserData.cs" />
     <Compile Include="Player\Models\EqualizerFrequencyBand.cs" />
     <Compile Include="Player\Models\EqualizerPreset.cs" />
     <Compile Include="Player\Models\ProviderPathsEventArgs.cs" />

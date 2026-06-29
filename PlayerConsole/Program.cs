@@ -1,7 +1,7 @@
-﻿using MusicPlayer.Common;
-using MusicPlayer.FileManagment;
-using MusicPlayer.Player.Models;
-using Newtonsoft.Json.Linq;
+﻿using MusicPlayer.FileManagment;
+using MusicPlayer.Helpers;
+using MusicPlayer.PlaylistManagement.Models;
+using Newtonsoft.Json;
 
 namespace PlayerConsole
 {
@@ -10,11 +10,18 @@ namespace PlayerConsole
         [STAThread]
         static async Task Main(string[] args)
         {
-            var configPath = Path.Combine(Constants.LIBRARY_DIRECTORY, "config.json");
-            var jsonString = FileManager.Instance.Read(configPath);
-            var root = JObject.Parse(jsonString);
-            var presetsToken = root["equalizerPresets"];
-            var equalizerConfig = presetsToken.ToObject<List<EqualizerPreset>>();
+            var jsonString = FileManager.Instance.Read("C:\\Users\\CYA\\AppData\\Local\\MongoDBCompass\\app-1.49.9\\music_server.playlists.json");
+            var root = JsonConvert.DeserializeObject<List<Playlist>>(jsonString, settings: JsonSerializationHelper.FileSerializerSettings);
+            var tracks = new List<PlaylistTrack>();
+
+            foreach (var track in root[1].Tracks)
+            {
+                track.Image = null;
+                tracks.Add(track);
+            }
+            root[1].Tracks = tracks;
+            var fixedJson = JsonConvert.SerializeObject(root, JsonSerializationHelper.FileSerializerSettings);
+            FileManager.Instance.Write("C:\\Users\\CYA\\AppData\\Local\\MongoDBCompass\\app-1.49.9\\test.json", fixedJson);
 
             //var mediaInfo = new MediaInfoWrapper(@"C:\Users\CYA\Music\Gorillaz - Humanz (Japanese Edition)\01 - Interlude New World.flac");
             //Console.WriteLine(mediaInfo.Tags.DiscNumber);

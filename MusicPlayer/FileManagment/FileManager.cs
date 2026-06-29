@@ -6,6 +6,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 
 namespace MusicPlayer.FileManagment
@@ -51,15 +52,32 @@ namespace MusicPlayer.FileManagment
 
         public string Read(string path) => File.ReadAllText(path);
 
-        public List<string> GetFilePaths(string pattern) => Directory.EnumerateFiles(_appDataDirectory, pattern, SearchOption.AllDirectories).ToList();
+        public List<string> GetFilePaths(string pattern) => Directory.EnumerateFiles(_appDataDirectory, pattern, SearchOption.TopDirectoryOnly).ToList();
+
+        public List<string> GetFilePaths(string pattern, string regexPattern)
+        {
+            var regex = new Regex(regexPattern, RegexOptions.IgnoreCase);
+            return Directory.EnumerateFiles(_appDataDirectory, pattern, SearchOption.TopDirectoryOnly).Where(file => regex.IsMatch(Path.GetFileNameWithoutExtension(file))).ToList();
+        }
 
         public List<string> GetResampledProviderFileNames() => Directory.EnumerateFiles(Constants.RESAMPLED_PROVIDERS_DIRECTORY).ToList();
 
-        public void ClearDirectory(string path = null)
+        public void ClearDirectory(string path = null, string patern = null, string regexPattern = null)
         {
             try
             {
                 if (!Directory.Exists(path ?? _appDataDirectory)) return;
+                if (!string.IsNullOrWhiteSpace(patern))
+                {
+                    if (!string.IsNullOrWhiteSpace(regexPattern))
+                    {
+                        var regex = new Regex(regexPattern, RegexOptions.IgnoreCase);
+                        var files = Directory.EnumerateFiles(path ?? _appDataDirectory, patern).Where(fileName => regex.IsMatch(Path.GetFileNameWithoutExtension(fileName)));
+                        Parallel.ForEach(files, file => RemoveFile(file));
+                        return;
+                    }
+                    Parallel.ForEach(Directory.EnumerateFiles(path ?? _appDataDirectory, patern), file => RemoveFile(file));
+                }
                 Parallel.ForEach(Directory.EnumerateFiles(path ?? _appDataDirectory), file => RemoveFile(file));
             }
             catch (Exception ex)

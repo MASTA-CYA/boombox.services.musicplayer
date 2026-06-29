@@ -45,9 +45,10 @@ namespace MusicPlayer.LibraryManagement
         public async Task<List<Album>> GetAlbumsAsync()
         {
             var databaseAlbums = await GetCachedDatabaseAlbumsAsync();
-            var mappedAlbums = await Task.Run(() => GetAlbums(databaseAlbums));
+            var cachedFavouriteTracks = (await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks;
+            var mappedAlbums = await Task.Run(() => GetAlbums(databaseAlbums, cachedFavouriteTracks));
             _ = Task.Run(async () => await UpsertMappedAlbumsAsync(databaseAlbums, mappedAlbums));
-            return mappedAlbums;
+            return mappedAlbums.ToList();
         }
 
         public PlaylistTrack GetTrackInformation(string filePath)
@@ -88,7 +89,7 @@ namespace MusicPlayer.LibraryManagement
             var albumPath = Path.GetDirectoryName(path);
             await MongoDbClient.Instance.UpdateTimesPlayedAsync(albumPath: albumPath, trackPath: path);
 
-            var filePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN);
+            var filePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
             var cachedAlbum = await MongoDbClient.Instance.GetAlbumAsync(albumPath);
             var appDataPath = filePaths.FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), cachedAlbum.Guid.ToString()));
             var albumFileContent = FileManager.Instance.Read(appDataPath);
@@ -102,25 +103,40 @@ namespace MusicPlayer.LibraryManagement
 
         public async Task UpdateIsFavoriteTrackAsync(string path)
         {
-            var (isFasvourite, guid) = await MongoDbClient.Instance.UpdateIsFavouriteAsync(albumPath: Path.GetDirectoryName(path), trackPath: path);
-            UpdatedFavouriteTrack?.Invoke(this, new FavouriteTrackEventArgs(path, isFasvourite));
+            try
+            {
+                var (isFasvourite, guid) = await MongoDbClient.Instance.UpdateIsFavouriteAsync(albumPath: Path.GetDirectoryName(path), trackPath: path);
+                UpdatedFavouriteTrack?.Invoke(this, new FavouriteTrackEventArgs(path, isFasvourite));
 
-            var track = ((await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks?.Find(playlistTrack => string.Equals(playlistTrack.Path, path)))
-                ?? GetTrackInformation(path);
+                var track = ((await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks?.Find(playlistTrack => string.Equals(playlistTrack.Path, path)))
+                    ?? GetTrackInformation(path);
 
-            await UpdateTrackUserDataAsync(path);
+                await UpdateTrackUserDataAsync(path);
 
-            if (isFasvourite)
-                await MongoDbClient.Instance.AddPlaylistTracksAsync("Favourite", new List<PlaylistTrack> { track });
-            else
-                await MongoDbClient.Instance.RemovePlaylistTracksAsync("Favourite", new List<PlaylistTrack> { track });
+                if (isFasvourite)
+                    await MongoDbClient.Instance.AddPlaylistTracksAsync("Favourite", new List<PlaylistTrack> { track });
+                else
+                    await MongoDbClient.Instance.RemovePlaylistTracksAsync("Favourite", new List<PlaylistTrack> { track });
 
-            var appDataPath = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN).FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), guid));
-            var albumFileContent = FileManager.Instance.Read(appDataPath);
-            var album = JsonConvert.DeserializeObject<Album>(albumFileContent, settings: JsonSerializationHelper.FileSerializerSettings);
-            var favouriteTrack = album.Tracks.Find(albumTrack => string.Equals(albumTrack.Path, path));
-            favouriteTrack.IsFavourite = isFasvourite;
-            FileManager.Instance.Write(album);
+                var appDataPath = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN).FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), guid));
+                var albumFileContent = FileManager.Instance.Read(appDataPath);
+                var album = JsonConvert.DeserializeObject<Album>(albumFileContent, settings: JsonSerializationHelper.FileSerializerSettings);
+                var favouriteTrack = album.Tracks.Find(albumTrack => string.Equals(albumTrack.Path, path));
+                favouriteTrack.IsFavourite = isFasvourite;
+                FileManager.Instance.Write(album);
+            }
+            catch (Exception ex)
+            {
+                await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
+                {
+                    Severity = Severity.Error,
+                    Source = "UpdateIsFavoriteTrackAsync",
+                    Line = ex.Message,
+                    TimeStamp = DateTime.Now,
+                    Exception = ex
+                });
+                Console.WriteLine(ex.Message);
+            }
         }
 
         public void HandleCreatedAlbum(string path)
@@ -154,7 +170,7 @@ namespace MusicPlayer.LibraryManagement
             {
                 try
                 {
-                    var filePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN);
+                    var filePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
                     var cachedAlbum = await MongoDbClient.Instance.GetAlbumAsync(path);
 
                     if (cachedAlbum != null)
@@ -182,14 +198,14 @@ namespace MusicPlayer.LibraryManagement
         public async Task ClearLocalCacheAsync()
         {
             await Task.CompletedTask;
-            FileManager.Instance.ClearDirectory();
+            FileManager.Instance.ClearDirectory(null, Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
         }
 
         #endregion Public Functions
 
         #region Private Functions
 
-        private List<Album> GetAlbums(List<Album> databaseAlbums)
+        private ConcurrentBag<Album> GetAlbums(List<Album> databaseAlbums, List<PlaylistTrack> cachedFavouriteTracks)
         {
             try
             {
@@ -210,13 +226,12 @@ namespace MusicPlayer.LibraryManagement
                     if (string.Equals(directoryName, "Singles"))
                     {
                         var savedSinglesAlbum = databaseAlbums?.Find(dbAlbum => string.Equals(dbAlbum.Path, directory));
-                        var singlesAlbum = MapSinglesAlbum(directory, savedSinglesAlbum, directoryInfo);
+                        var singlesAlbum = MapSinglesAlbum(directory, savedSinglesAlbum, cachedFavouriteTracks, directoryInfo);
                         albums.Add(singlesAlbum);
                         return;
                     }
 
                     var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories);
-
                     if (!files.Any()) return;
 
                     Album album = null;
@@ -225,6 +240,7 @@ namespace MusicPlayer.LibraryManagement
 
                     var imageFiles = files.Where(file => _imageFileExtensions.Contains(Path.GetExtension(file))).ToList();
                     var imageFile = GetHighestResolutionImage(imageFiles);
+
 
                     Parallel.ForEach(files, file =>
                     {
@@ -238,7 +254,9 @@ namespace MusicPlayer.LibraryManagement
                                 album = MapAlbumMetaData(mediaInfo, file, savedAlbum, directoryInfo.CreationTime);
 
                             var savedtrack = savedAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
-                            tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack));
+                            var presetGuid = Task.Run(async () => await GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty)).GetAwaiter().GetResult();
+                            var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
+                            tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
                         }
                         catch (Exception ex)
                         {
@@ -280,7 +298,7 @@ namespace MusicPlayer.LibraryManagement
                 });
 
                 MappingUpdate.IsComplete = true;
-                return albums.ToList(); ;
+                return albums;
             }
             catch (UnauthorizedAccessException ex)
             {
@@ -312,7 +330,7 @@ namespace MusicPlayer.LibraryManagement
             }
         }
 
-        private Album MapSinglesAlbum(string directory, Album savedAlbum, DirectoryInfo directoryInfo)
+        private Album MapSinglesAlbum(string directory, Album savedAlbum, List<PlaylistTrack> cachedFavouriteTracks, DirectoryInfo directoryInfo)
         {
             var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories);
 
@@ -343,7 +361,9 @@ namespace MusicPlayer.LibraryManagement
                 {
                     var mediaInfo = new MediaInfoWrapper(file);
                     var savedtrack = savedAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
-                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack));
+                    var presetGuid = Task.Run(async () => await GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty)).GetAwaiter().GetResult();
+                    var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
+                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
                 }
                 catch (Exception ex)
                 {
@@ -401,7 +421,9 @@ namespace MusicPlayer.LibraryManagement
                     if (album == null)
                         album = MapAlbumMetaData(mediaInfo, file, null, directoryInfo.CreationTime);
 
-                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, null));
+                    var presetGuid = Task.Run(async () => await GetTrackEqualizerPresetGuidAsync(file, Guid.Empty)).GetAwaiter().GetResult();
+                    var isFavourite = Task.Run(async () => ((await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file))) ?? false).GetAwaiter().GetResult();
+                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, null, presetGuid, isFavourite));
                 }
                 catch (Exception ex)
                 {
@@ -488,7 +510,7 @@ namespace MusicPlayer.LibraryManagement
             return 0;
         }
 
-        private Track MapAlbumTrackMetaData(MediaInfoWrapper metadata, string AlbumArtistFallback, string path, Track track)
+        private Track MapAlbumTrackMetaData(MediaInfoWrapper metadata, string AlbumArtistFallback, string path, Track track, Guid presetGuid, bool isFavourite)
         {
             return new Track
             {
@@ -498,7 +520,8 @@ namespace MusicPlayer.LibraryManagement
                 Artist = GetTrackArtist(metadata.Tags.AlbumArtist, metadata.Tags.Artist, AlbumArtistFallback),
                 Duration = GetTrackDuration(metadata.Duration, path),
                 TimesPlayed = track?.TimesPlayed ?? 0,
-                IsFavourite = track?.IsFavourite ?? false,
+                IsFavourite = isFavourite || (track?.IsFavourite ?? false),
+                EqualizerGuid = presetGuid,
                 Path = path,
             };
         }
@@ -545,15 +568,19 @@ namespace MusicPlayer.LibraryManagement
                 || fileName.StartsWith("folder", StringComparison.OrdinalIgnoreCase);
         }
 
-        private async Task UpsertMappedAlbumsAsync(List<Album> savedAlbums, List<Album> mappedAlbums)
+        private async Task UpsertMappedAlbumsAsync(List<Album> savedAlbums, ConcurrentBag<Album> mappedAlbums)
         {
+            await Task.CompletedTask;
+
             try
             {
-                foreach (var album in mappedAlbums)
+                Parallel.ForEach(mappedAlbums, async (album) =>
+                {
                     if (savedAlbums.Any(dbAlbum => string.Equals(dbAlbum.Path, album.Path)))
                         await MongoDbClient.Instance.UpdateAlbumAsync(album);
                     else
                         await MongoDbClient.Instance.InsertAlbumAsync(album);
+                });
             }
             catch (Exception)
             {
@@ -593,7 +620,29 @@ namespace MusicPlayer.LibraryManagement
                 return null;
             }
         }
-    }
 
-    #endregion Private Functions
+        private async Task<Guid> GetTrackEqualizerPresetGuidAsync(string path, Guid equalizerGuid)
+        {
+            if (equalizerGuid != Guid.Empty) return equalizerGuid;
+
+            try
+            {
+                return (await MongoDbClient.Instance.GetEqualizerPresetAsync(path))?.Guid ?? Guid.Empty;
+            }
+            catch (Exception ex)
+            {
+                await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
+                {
+                    Severity = Severity.Error,
+                    Source = "GetTrackEqualizerPresetAsync",
+                    Line = ex.Message,
+                    TimeStamp = DateTime.Now,
+                    Exception = ex
+                });
+                MappingUpdate.Error = ex.Message;
+                return Guid.Empty;
+            }
+        }
+        #endregion Private Functions
+    }
 }
