@@ -412,7 +412,7 @@ namespace MusicPlayer.LibraryManagement
 
             Parallel.ForEach(files, file =>
             {
-                if (!_audioFileExtensions.Contains(Path.GetExtension(file))) return;
+                if (!_audioFileExtensions.Contains(Path.GetExtension(file).ToLower())) return;
 
                 try
                 {

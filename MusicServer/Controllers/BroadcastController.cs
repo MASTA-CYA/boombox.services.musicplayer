@@ -6,6 +6,7 @@ using MusicPlayer.PlaylistManagement;
 using MusicPlayer.PlaylistManagement.Models;
 using MusicServer.Helpers;
 using MusicServer.Hubs;
+using System.Reflection;
 using System.Text.Json;
 
 namespace MusicServer.Controllers
@@ -49,7 +50,7 @@ namespace MusicServer.Controllers
 
         private async Task StartPlaybackInformationBroadcastAsync(CancellationToken token)
         {
-            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(250));
+            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(500));
             try
             {
                 while (await timer.WaitForNextTickAsync(token))
@@ -96,7 +97,7 @@ namespace MusicServer.Controllers
 
         private async Task StartPlaylistBroadcastAsync(CancellationToken token)
         {
-            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(1000));
+            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(2000));
             try
             {
                 while (await timer.WaitForNextTickAsync(token))
@@ -200,8 +201,9 @@ namespace MusicServer.Controllers
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
             try
             {
+                var version = Assembly.GetEntryAssembly()?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
                 while (await timer.WaitForNextTickAsync(token))
-                    await _serverHub.Clients.All.SendAsync("ReceiveServerUpdates", null, token);
+                    await _serverHub.Clients.All.SendAsync("ReceiveServerUpdates", version, token);
             }
             catch (Exception ex)
             {

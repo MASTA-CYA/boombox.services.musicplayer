@@ -44,6 +44,7 @@ namespace MusicPlayer.Player
         {
             var drivers = AsioOut.GetDriverNames();
             _activeDriver = drivers.FirstOrDefault(driver => string.Equals(driver, ASIO_DRIVER));
+            PrepareEqualizerPresets();
         }
 
         #endregion Singleton
@@ -56,11 +57,12 @@ namespace MusicPlayer.Player
             _playbackInformation = new PlaybackInformation();
             _isInitialized = true;
             LibraryManager.Instance.UpdatedFavouriteTrack += HandleUpdatedFavouriteTrack;
-            PrepareEqualizerPresets();
         }
 
         public void Play(string[] paths)
         {
+            if (!_isInitialized) InitializePlayer();
+
             _playbackInformation = new PlaybackInformation();
             _queuedPlaylist = new List<PlaylistTrack>(paths.Select(LibraryManager.Instance.GetTrackInformation));
 
@@ -258,7 +260,7 @@ namespace MusicPlayer.Player
         private void PrepareEqualizerPresets()
         {
             EqualizerPresets = Task.Run(async () => await MongoDbClient.Instance.GetEqualizerPresetsAsync()).GetAwaiter().GetResult();
-            _flatFrequencyBandGains = EqualizerPresets.FirstOrDefault(preset => string.Equals(preset.Name, "Flat"))?.FrequencyBands.Select(band => band.Frequency).ToArray();
+            _flatFrequencyBandGains = EqualizerPresets.FirstOrDefault(preset => string.Equals(preset.Name, "Flat"))?.FrequencyBands.Select(band => band.Gain).ToArray();
 
             if (EqualizerPresets.Any()) return;
 

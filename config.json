@@ -12,56 +12,56 @@
 				},
 				{
 					"Name": "100Hz",
-					"Frequency": 50,
+					"Frequency": 100,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
 				},
 				{
 					"Name": "250Hz",
-					"Frequency": 50,
+					"Frequency": 250,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
 				},
 				{
 					"Name": "500Hz",
-					"Frequency": 50,
+					"Frequency": 500,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
 				},
 				{
 					"Name": "1KHz",
-					"Frequency": 50,
+					"Frequency": 1000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
 				},
 				{
 					"Name": "2KHz",
-					"Frequency": 50,
+					"Frequency": 2000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
 				},
 				{
 					"Name": "4KHz",
-					"Frequency": 50,
+					"Frequency": 4000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
 				},
 				{
 					"Name": "8KHz",
-					"Frequency": 50,
+					"Frequency": 8000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
 				},
 				{
 					"Name": "16KHz",
-					"Frequency": 50,
+					"Frequency": 16000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
@@ -81,56 +81,56 @@
 				},
 				{
 					"Name": "100Hz",
-					"Frequency": 50,
+					"Frequency": 100,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 4
 				},
 				{
 					"Name": "250Hz",
-					"Frequency": 50,
+					"Frequency": 250,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 2
 				},
 				{
 					"Name": "500Hz",
-					"Frequency": 50,
+					"Frequency": 500,
 					"Min": -15,
 					"Max": 15,
 					"Gain": -2
 				},
 				{
 					"Name": "1KHz",
-					"Frequency": 50,
+					"Frequency": 1000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
 				},
 				{
 					"Name": "2KHz",
-					"Frequency": 50,
+					"Frequency": 2000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
 				},
 				{
 					"Name": "4KHz",
-					"Frequency": 50,
+					"Frequency": 4000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 3
 				},
 				{
 					"Name": "8KHz",
-					"Frequency": 50,
+					"Frequency": 8000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 4
 				},
 				{
 					"Name": "16KHz",
-					"Frequency": 50,
+					"Frequency": 16000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 5
@@ -150,56 +150,56 @@
 				},
 				{
 					"Name": "100Hz",
-					"Frequency": 50,
+					"Frequency": 100,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 4
 				},
 				{
 					"Name": "250Hz",
-					"Frequency": 50,
+					"Frequency": 250,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 2
 				},
 				{
 					"Name": "500Hz",
-					"Frequency": 50,
+					"Frequency": 500,
 					"Min": -15,
 					"Max": 15,
 					"Gain": -4
 				},
 				{
 					"Name": "1KHz",
-					"Frequency": 50,
+					"Frequency": 1000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 0
 				},
 				{
 					"Name": "2KHz",
-					"Frequency": 50,
+					"Frequency": 2000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 2
 				},
 				{
 					"Name": "4KHz",
-					"Frequency": 50,
+					"Frequency": 4000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 5
 				},
 				{
 					"Name": "8KHz",
-					"Frequency": 50,
+					"Frequency": 8000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 5
 				},
 				{
 					"Name": "16KHz",
-					"Frequency": 50,
+					"Frequency": 16000,
 					"Min": -15,
 					"Max": 15,
 					"Gain": 4

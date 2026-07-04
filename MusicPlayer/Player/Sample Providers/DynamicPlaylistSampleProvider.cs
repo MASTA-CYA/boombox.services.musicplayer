@@ -77,15 +77,38 @@ namespace MusicPlayer.Player
             _activeFrequencyBandGains[bandIndex] = gainDb;
 
             for (int ch = 0; ch < WaveFormat.Channels; ch++)
-                //_equalizerFrequencyFilters[bandIndex, ch].SetPeakingEq(sampleRate, _flatEqualizerFrequencyGains[bandIndex], BAND_WIDTH_Q, gainDb);
                 _equalizerFrequencyFilters[bandIndex, ch].SetPeakingEq(WaveFormat.SampleRate, _flatEqualizerFrequencyGains[bandIndex], BAND_WIDTH_Q, _activeFrequencyBandGains[bandIndex]);
         }
 
-        public void SetPresetFrequencyBandGains(EqualizerFrequencyBand[] bands)
+        public void SetPresetFrequencyBandGains(EqualizerFrequencyBand[] bands = null)
         {
-            var orderedBandGains = bands.OrderBy(band => band.Frequency).Select(orderedBand => orderedBand.Gain).ToArray();
-            for (int i = 0; i < orderedBandGains.Length; i++)
-                SetFrequencyBandGain(i, orderedBandGains[i]);
+            try
+            {
+                var orderedBandGains = _flatEqualizerFrequencyGains;
+
+                if (bands != null)
+                    orderedBandGains = bands.OrderBy(band => band.Frequency).Select(orderedBand => orderedBand.Gain).ToArray();
+
+                if (orderedBandGains.Any(band => band > 15 || band < -15))
+                    throw new InvalidDataException("Band gain exceeded limits");
+
+                for (int i = 0; i < orderedBandGains.Length; i++)
+                    SetFrequencyBandGain(i, orderedBandGains[i]);
+            }
+            catch (Exception ex)
+            {
+                Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
+                {
+                    Severity = Severity.Error,
+                    Source = "SetPresetFrequencyBandGains",
+                    Line = ex.Message,
+                    TimeStamp = DateTime.Now,
+                    Exception = ex
+                }));
+                Console.WriteLine(ex);
+            }
+
+
         }
 
         private IEnumerable<ISampleProvider> GetUnsampledProviders(Dictionary<string, EqualizerPreset> trackConfigurations)
@@ -257,19 +280,20 @@ namespace MusicPlayer.Player
             {
                 case PlaybackMode.Shuffle:
                     HandleShufflePlayback();
-                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset.FrequencyBands.ToArray());
+                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset?.FrequencyBands?.ToArray());
                     break;
                 case PlaybackMode.RepeatAll:
                     HandleRepeatAllPlayback();
-                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset.FrequencyBands.ToArray());
+                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset?.FrequencyBands?.ToArray());
                     break;
                 case PlaybackMode.RepeatOne:
                     HandleRepeatOnePlayback();
+                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset?.FrequencyBands?.ToArray());
                     break;
                 case PlaybackMode.Sequential:
                 default:
                     HandleSequentialPlayback();
-                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset.FrequencyBands.ToArray());
+                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset?.FrequencyBands?.ToArray());
                     break;
             }
         }

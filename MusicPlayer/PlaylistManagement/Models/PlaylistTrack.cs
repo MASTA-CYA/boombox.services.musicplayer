@@ -12,7 +12,7 @@ namespace MusicPlayer.PlaylistManagement.Models
         [BsonIgnore] public double PlayedDuration { get; set; } = 0;
         public double TotalDuration { get; set; }
         [BsonIgnore] public bool IsPlaying { get; set; }
-        [BsonIgnore] public bool IsFavourite { get; set; }
+        public bool IsFavourite { get; set; }
         public string Path { get; set; }
         [BsonIgnore] public EqualizerPreset EqualizerPreset { get; set; }
 
