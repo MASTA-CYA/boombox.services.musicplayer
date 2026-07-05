@@ -7,6 +7,7 @@
     <UserSecretsId>8a8eae18-389f-4a32-861f-921db8950f0d</UserSecretsId>
     <Deterministic>False</Deterministic>
     <AssemblyVersion>1.0.*</AssemblyVersion>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
   </PropertyGroup>
 
   <ItemGroup>
