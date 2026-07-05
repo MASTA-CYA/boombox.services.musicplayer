@@ -201,7 +201,7 @@ namespace MusicServer.Controllers
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
             try
             {
-                var version = Assembly.GetEntryAssembly()?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+                var version = Assembly.GetEntryAssembly()?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion[..13];
                 while (await timer.WaitForNextTickAsync(token))
                     await _serverHub.Clients.All.SendAsync("ReceiveServerUpdates", version, token);
             }
