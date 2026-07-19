@@ -171,15 +171,13 @@ namespace MusicPlayer.FileManagment
         private void OnCreated(object sender, FileSystemEventArgs e)
         {
             if (string.Equals(e.FullPath, Constants.RESAMPLED_PROVIDERS_DIRECTORY)) return;
-
-            _debouncer.Debounce(() => LibraryManager.Instance.HandleCreatedAlbum(e.FullPath), milliseconds: 120000);
+            _debouncer.Debounce(LibraryManager.Instance.HandleNewAlbumAdded, milliseconds: 120000);
         }
 
         private void OnDeleted(object sender, FileSystemEventArgs e)
         {
             if (string.Equals(e.FullPath, Constants.RESAMPLED_PROVIDERS_DIRECTORY)) return;
-
-            LibraryManager.Instance.HandleDeletedAlbum(e.FullPath);
+            LibraryManager.Instance.HandleDeletedAlbums();
         }
 
         private void OnError(object sender, ErrorEventArgs e)

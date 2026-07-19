@@ -96,6 +96,12 @@ namespace MusicServer.Hubs
             await Clients.All.SendAsync("ReceiveLocalCacheCleared");
         }
 
+        public async Task RefreshAlbumAsync(string path)
+        {
+            await LibraryManager.Instance.RefreshAlbumAsync(path);
+            await Clients.All.SendAsync("ReceiveRefreshedAlbum");
+        }
+
         #endregion Public Methods
 
         #region Private Methods

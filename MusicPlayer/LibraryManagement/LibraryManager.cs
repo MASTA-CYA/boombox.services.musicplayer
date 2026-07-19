@@ -139,59 +139,69 @@ namespace MusicPlayer.LibraryManagement
             }
         }
 
-        public void HandleCreatedAlbum(string path)
+        public void HandleNewAlbumAdded()
         {
-            Task.Run(async () =>
+            Task.Run(() =>
             {
-                try
-                {
-                    var album = GetCreatedAlbum(path);
-                    await MongoDbClient.Instance.InsertAlbumAsync(album);
-                    FileManager.Instance.Write(album);
-                }
-                catch (Exception ex)
-                {
-                    await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                    {
-                        Severity = Severity.Error,
-                        Source = "HandleCreatedAlbum",
-                        Line = ex.Message,
-                        TimeStamp = DateTime.Now,
-                        Exception = ex
-                    });
-                    Console.WriteLine(ex.Message);
-                }
+                Parallel.ForEach(GetUnmappedDirectories(), async (directory) => await MapCreatedAlbumAsync(directory));
             });
         }
 
-        public void HandleDeletedAlbum(string path)
+        public async Task MapCreatedAlbumAsync(string path)
         {
-            Task.Run(async () =>
+            try
             {
-                try
+                var album = GetCreatedAlbum(path);
+                if (album == null) return;
+                await MongoDbClient.Instance.InsertAlbumAsync(album);
+                FileManager.Instance.Write(album);
+            }
+            catch (Exception ex)
+            {
+                await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
                 {
-                    var filePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
-                    var cachedAlbum = await MongoDbClient.Instance.GetAlbumAsync(path);
+                    Severity = Severity.Error,
+                    Source = "MapCreatedAlbumAsync",
+                    Line = ex.Message,
+                    TimeStamp = DateTime.Now,
+                    Exception = ex
+                });
+                Console.WriteLine(ex.Message);
+            }
+        }
 
-                    if (cachedAlbum != null)
-                        await MongoDbClient.Instance.DeleteAlbumAsync(path);
-
-                    var appDataPath = filePaths.FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), cachedAlbum?.Guid.ToString()));
-                    if (appDataPath != null)
-                        FileManager.Instance.RemoveFile(appDataPath);
-                }
-                catch (Exception ex)
+        public void HandleDeletedAlbums()
+        {
+            Task.Run(() =>
+            {
+                Parallel.ForEach(GetUnmappedDirectories(), async (directory) =>
                 {
-                    await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
+                    try
                     {
-                        Severity = Severity.Error,
-                        Source = "HandleDeletedAlbum",
-                        Line = ex.Message,
-                        TimeStamp = DateTime.Now,
-                        Exception = ex
-                    });
-                    Console.WriteLine(ex.Message);
-                }
+                        var cachedAlbum = await MongoDbClient.Instance.GetAlbumAsync(directory);
+
+                        if (cachedAlbum != null)
+                            await MongoDbClient.Instance.DeleteAlbumAsync(directory);
+
+                        var appDataPath = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN).FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), cachedAlbum?.Guid.ToString()));
+                        if (appDataPath != null)
+                            FileManager.Instance.RemoveFile(appDataPath);
+                    }
+
+                    catch (Exception ex)
+                    {
+                        await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
+                        {
+                            Severity = Severity.Error,
+                            Source = "HandleDeletedAlbums",
+                            Line = ex.Message,
+                            TimeStamp = DateTime.Now,
+                            Exception = ex
+                        });
+                        Console.WriteLine(ex.Message);
+                    }
+                    ;
+                });
             });
         }
 
@@ -199,6 +209,17 @@ namespace MusicPlayer.LibraryManagement
         {
             await Task.CompletedTask;
             FileManager.Instance.ClearDirectory(null, Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
+        }
+
+        public async Task RefreshAlbumAsync(string path)
+        {
+            var databaseAlbum = await GetCachedDatabaseAlbumAsync(path);
+            var cachedFavouriteTracks = (await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks;
+
+            var mappedAlbum = RefreshMappedAlbum(path, databaseAlbum, cachedFavouriteTracks);
+            SelectedAlbum = JsonConvert.SerializeObject(mappedAlbum, JsonSerializationHelper.NamingSerializerSettings);
+            _ = Task.Run(async () => await UpsertMappedAlbumsAsync(new List<Album> { databaseAlbum }, new ConcurrentBag<Album> { mappedAlbum }));
+            _ = Task.Run(() => FileManager.Instance.Write(mappedAlbum));
         }
 
         #endregion Public Functions
@@ -244,7 +265,7 @@ namespace MusicPlayer.LibraryManagement
 
                     Parallel.ForEach(files, file =>
                     {
-                        if (!_audioFileExtensions.Contains(Path.GetExtension(file))) return;
+                        if (!_audioFileExtensions.Contains(Path.GetExtension(file).ToLower())) return;
 
                         try
                         {
@@ -355,7 +376,7 @@ namespace MusicPlayer.LibraryManagement
 
             Parallel.ForEach(files, file =>
             {
-                if (!_audioFileExtensions.Contains(Path.GetExtension(file))) return;
+                if (!_audioFileExtensions.Contains(Path.GetExtension(file).ToLower())) return;
 
                 try
                 {
@@ -449,6 +470,84 @@ namespace MusicPlayer.LibraryManagement
             }
 
             album.Id = ObjectId.GenerateNewId();
+            album.NumberOfTracks = tracks.Count;
+            album.Duration = tracks.Sum(track => track.Duration);
+            album.Tracks = tracks.OrderBy(track => track.TrackNumber).ToList();
+            album.Path = path;
+
+            var numberOfDiscs = tracks.Max(track => track.DiscNumber);
+            if (album.NumberOfDiscs == 0 && numberOfDiscs > 0)
+                album.NumberOfDiscs = numberOfDiscs;
+
+            return album;
+        }
+
+        private Album RefreshMappedAlbum(string path, Album databaseAlbum = null, List<PlaylistTrack> cachedFavouriteTracks = null)
+        {
+            var files = Directory.EnumerateFiles(path, "*.*", SearchOption.AllDirectories);
+
+            if (!files.Any()) return null;
+
+            Album album = null;
+            ConcurrentBag<Track> tracks = new ConcurrentBag<Track>();
+
+            var imageFiles = files.Where(file => _imageFileExtensions.Contains(Path.GetExtension(file))).ToList();
+            var imageFile = GetHighestResolutionImage(imageFiles);
+
+            if (string.Equals(path, "Singles"))
+            {
+                var singlesAlbum = MapSinglesAlbum(path, databaseAlbum, cachedFavouriteTracks, new DirectoryInfo(path));
+                album = singlesAlbum;
+                return null;
+            }
+
+            var directoryInfo = new DirectoryInfo(path);
+            var directoryName = directoryInfo.Name;
+            if (_directoryExclusions.Contains(directoryName)) return null;
+
+            Parallel.ForEach(files, file =>
+            {
+                if (!_audioFileExtensions.Contains(Path.GetExtension(file).ToLower())) return;
+
+                try
+                {
+                    var mediaInfo = new MediaInfoWrapper(file);
+
+                    if (album == null)
+                        album = MapAlbumMetaData(mediaInfo, file, databaseAlbum, directoryInfo.CreationTime);
+
+                    var savedtrack = databaseAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
+                    var presetGuid = Task.Run(async () => await GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty)).GetAwaiter().GetResult();
+                    var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
+                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
+                }
+                catch (Exception ex)
+                {
+                    Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
+                    {
+                        Severity = Severity.Error,
+                        Source = "GetAlbums",
+                        Line = ex.Message,
+                        TimeStamp = DateTime.Now,
+                        Exception = ex
+                    }));
+                    MappingUpdate.Error = $"Unable to map metadata: {ex.Message}";
+                    Console.WriteLine($"Unable to map metadata: {ex.Message}");
+                }
+            });
+
+
+            if (album == null) return null;
+            if (album.Name == null || album.Artist == "Unknown") return null;
+
+            if (!string.IsNullOrWhiteSpace(imageFile))
+            {
+                var imageBytes = File.ReadAllBytes(imageFile);
+                album.Image = $"data:image/{Path.GetExtension(imageFile)};base64,{Convert.ToBase64String(imageBytes)}";
+            }
+
+            album.Guid = databaseAlbum?.Guid ?? Guid.NewGuid();
+            album.Id = databaseAlbum?.Id ?? ObjectId.GenerateNewId();
             album.NumberOfTracks = tracks.Count;
             album.Duration = tracks.Sum(track => track.Duration);
             album.Tracks = tracks.OrderBy(track => track.TrackNumber).ToList();
@@ -621,6 +720,27 @@ namespace MusicPlayer.LibraryManagement
             }
         }
 
+        private async Task<Album> GetCachedDatabaseAlbumAsync(string path)
+        {
+            try
+            {
+                return await MongoDbClient.Instance.GetAlbumAsync(path);
+            }
+            catch (Exception ex)
+            {
+                await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
+                {
+                    Severity = Severity.Error,
+                    Source = "GetCachedDatabaseAlbumsAsync",
+                    Line = ex.Message,
+                    TimeStamp = DateTime.Now,
+                    Exception = ex
+                });
+                MappingUpdate.Error = ex.Message;
+                return null;
+            }
+        }
+
         private async Task<Guid> GetTrackEqualizerPresetGuidAsync(string path, Guid equalizerGuid)
         {
             if (equalizerGuid != Guid.Empty) return equalizerGuid;
@@ -643,6 +763,21 @@ namespace MusicPlayer.LibraryManagement
                 return Guid.Empty;
             }
         }
+
+        private List<string> GetUnmappedDirectories()
+        {
+            var directories = Directory.EnumerateDirectories(Constants.LIBRARY_DIRECTORY, "*.*", SearchOption.TopDirectoryOnly);
+            var filePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
+            var mappedAlbumPaths = new ConcurrentBag<string>();
+            Parallel.ForEach(filePaths, file =>
+            {
+                var contents = FileManager.Instance.Read(file);
+                var album = JsonConvert.DeserializeObject<Album>(contents, settings: JsonSerializationHelper.FileSerializerSettings);
+                mappedAlbumPaths.Add(album.Path);
+            });
+            return directories.Except(mappedAlbumPaths).ToList();
+        }
+
         #endregion Private Functions
     }
 }
