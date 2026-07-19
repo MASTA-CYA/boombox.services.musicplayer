@@ -220,8 +220,8 @@
     <Compile Include="Extensions\DictionaryExtensions.cs" />
     <Compile Include="Extensions\ListExtensions.cs" />
     <Compile Include="Extensions\SampleProviderExtensions.cs" />
-    <Compile Include="FileManagment\FileManager.cs" />
-    <Compile Include="FileManagment\Interfaces\IFileWritable.cs" />
+    <Compile Include="FileManagement\FileManager.cs" />
+    <Compile Include="FileManagement\Interfaces\IFileWritable.cs" />
     <Compile Include="Helpers\JsonSerializationHelper.cs" />
     <Compile Include="LibraryManagement\Converters\ObjectIdConverter.cs" />
     <Compile Include="LibraryManagement\LibraryManager.cs" />

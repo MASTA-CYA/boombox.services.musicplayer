@@ -1,5 +1,5 @@
 ﻿using MusicPlayer.Common;
-using MusicPlayer.FileManagment;
+using MusicPlayer.FileManagement;
 using MusicPlayer.Helpers;
 using MusicPlayer.LibraryManagement;
 using MusicPlayer.LibraryManagement.Models;

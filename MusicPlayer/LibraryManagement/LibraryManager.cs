@@ -1,7 +1,7 @@
 ﻿using MediaInfo;
 using MongoDB.Bson;
 using MusicPlayer.Common;
-using MusicPlayer.FileManagment;
+using MusicPlayer.FileManagement;
 using MusicPlayer.Helpers;
 using MusicPlayer.LibraryManagement.Models;
 using MusicPlayer.Models;

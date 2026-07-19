@@ -1,6 +1,6 @@
 ﻿using Microsoft.AspNetCore.SignalR;
 using MusicPlayer.Common;
-using MusicPlayer.FileManagment;
+using MusicPlayer.FileManagement;
 using MusicPlayer.LibraryManagement;
 using MusicPlayer.LibraryManagement.Models;
 using MusicPlayer.Models;

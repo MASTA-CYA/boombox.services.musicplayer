@@ -1,6 +1,6 @@
 ﻿using MusicPlayer.Common;
 using MusicPlayer.Extensions;
-using MusicPlayer.FileManagment;
+using MusicPlayer.FileManagement;
 using MusicPlayer.Models;
 using MusicPlayer.Player.Models;
 using NAudio.Dsp;
