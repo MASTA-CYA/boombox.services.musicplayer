@@ -29,7 +29,7 @@ namespace MusicPlayer.Player
         public IEnumerable<ISampleProvider> Providers { get => GetProviders(); }
         private ISampleProvider _currentProvider;
 
-        private readonly float[] _flatEqualizerFrequencyGains;
+        private readonly float[] _bandCenterFrequencies;
         private readonly BiQuadFilter[,] _equalizerFrequencyFilters;
         private readonly float[] _activeFrequencyBandGains;
 
@@ -53,7 +53,7 @@ namespace MusicPlayer.Player
             _proposedOrder = new List<string>();
             _removedProviders = new List<string>();
 
-            _flatEqualizerFrequencyGains = frequencies;
+            _bandCenterFrequencies = frequencies;
             _activeFrequencyBandGains = (_currentProvider as EnhancedAudioFileReader).EqualizerPreset?.FrequencyBands?.Select(band => band.Gain).ToArray() ?? new float[9];
             _equalizerFrequencyFilters = new BiQuadFilter[9, WaveFormat.Channels];
             CreateEqualizerFrequencyFilters();
@@ -67,7 +67,7 @@ namespace MusicPlayer.Player
             for (int band = 0; band < 9; band++)
                 for (int ch = 0; ch < channels; ch++)
                     // Create a Peaking EQ filter for every frequency band and channel
-                    _equalizerFrequencyFilters[band, ch] = BiQuadFilter.PeakingEQ(sampleRate, _flatEqualizerFrequencyGains[band], BAND_WIDTH_Q, _activeFrequencyBandGains[band]);
+                    _equalizerFrequencyFilters[band, ch] = BiQuadFilter.PeakingEQ(sampleRate, _bandCenterFrequencies[band], BAND_WIDTH_Q, _activeFrequencyBandGains[band]);
         }
 
         public void SetFrequencyBandGain(int bandIndex, float gainDb)
@@ -77,14 +77,14 @@ namespace MusicPlayer.Player
             _activeFrequencyBandGains[bandIndex] = gainDb;
 
             for (int ch = 0; ch < WaveFormat.Channels; ch++)
-                _equalizerFrequencyFilters[bandIndex, ch].SetPeakingEq(WaveFormat.SampleRate, _flatEqualizerFrequencyGains[bandIndex], BAND_WIDTH_Q, _activeFrequencyBandGains[bandIndex]);
+                _equalizerFrequencyFilters[bandIndex, ch].SetPeakingEq(WaveFormat.SampleRate, _bandCenterFrequencies[bandIndex], BAND_WIDTH_Q, _activeFrequencyBandGains[bandIndex]);
         }
 
         public void SetPresetFrequencyBandGains(EqualizerFrequencyBand[] bands = null)
         {
             try
             {
-                var orderedBandGains = _flatEqualizerFrequencyGains;
+                var orderedBandGains = new float[_bandCenterFrequencies.Length]; // "Flat" fallback = zero gain on every band
 
                 if (bands != null)
                     orderedBandGains = bands.OrderBy(band => band.Frequency).Select(orderedBand => orderedBand.Gain).ToArray();

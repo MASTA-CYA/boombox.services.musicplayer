@@ -63,3 +63,4 @@ publish/
 tasks.txt
 .gitignore
 .vs/
+KNOWN_ISSUES.md

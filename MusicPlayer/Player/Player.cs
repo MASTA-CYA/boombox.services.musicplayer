@@ -25,7 +25,7 @@ namespace MusicPlayer.Player
         private AsioOut _audioPlayer;
         private DynamicPlaylistSampleProvider _playlistProvider;
         private List<PlaylistTrack> _queuedPlaylist;
-        private float[] _flatFrequencyBandGains;
+        private float[] _bandCenterFrequencies;
 
         private bool _isInitialized;
         private readonly object _locker = new object();
@@ -68,7 +68,7 @@ namespace MusicPlayer.Player
 
             var trackConfigurations = _queuedPlaylist.ToDictionary(track => track.Path, Track => Track.EqualizerPreset);
 
-            _playlistProvider = new DynamicPlaylistSampleProvider(trackConfigurations, _flatFrequencyBandGains);
+            _playlistProvider = new DynamicPlaylistSampleProvider(trackConfigurations, _bandCenterFrequencies);
             _playlistProvider.ReachedEndOfProvider += HandleReachedEndOfTrack;
             _playlistProvider.ReachedEndOfPlaylist += HandleReachedEndOfPlaylist;
             _playlistProvider.QueuedProvidersAdded += HandleQueuedProvidersAdded;
@@ -260,7 +260,7 @@ namespace MusicPlayer.Player
         private void PrepareEqualizerPresets()
         {
             EqualizerPresets = Task.Run(async () => await MongoDbClient.Instance.GetEqualizerPresetsAsync()).GetAwaiter().GetResult();
-            _flatFrequencyBandGains = EqualizerPresets.FirstOrDefault(preset => string.Equals(preset.Name, "Flat"))?.FrequencyBands.Select(band => band.Gain).ToArray();
+            _bandCenterFrequencies = EqualizerPresets.FirstOrDefault(preset => string.Equals(preset.Name, "Flat"))?.FrequencyBands.OrderBy(band => band.Frequency).Select(band => band.Frequency).ToArray();
 
             if (EqualizerPresets.Any()) return;
 
