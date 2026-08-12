@@ -13,6 +13,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using TagLibSharp2.Core;
 
@@ -141,9 +142,22 @@ namespace MusicPlayer.LibraryManagement
 
         public void HandleNewAlbumAdded()
         {
-            Task.Run(() =>
+            // Fires off a bounded set of real awaited tasks instead of Parallel.ForEach with an async lambda —
+            // Parallel.ForEach treats an async delegate as "fire and forget" (it matches Action<T> as async void
+            // under the hood), so it was never actually waiting for MapCreatedAlbumAsync to finish, and any
+            // exception thrown inside it would have become an unobserved async-void exception.
+            Task.Run(async () =>
             {
-                Parallel.ForEach(GetUnmappedDirectories(), async (directory) => await MapCreatedAlbumAsync(directory));
+                using (var throttle = new SemaphoreSlim(Environment.ProcessorCount))
+                {
+                    var mappingTasks = GetUnmappedDirectories().Select(async directory =>
+                    {
+                        await throttle.WaitAsync();
+                        try { await MapCreatedAlbumAsync(directory); }
+                        finally { throttle.Release(); }
+                    });
+                    await Task.WhenAll(mappingTasks);
+                }
             });
         }
 
@@ -151,7 +165,7 @@ namespace MusicPlayer.LibraryManagement
         {
             try
             {
-                var album = GetCreatedAlbum(path);
+                var album = await GetCreatedAlbumAsync(path);
                 if (album == null) return;
                 await MongoDbClient.Instance.InsertAlbumAsync(album);
                 FileManager.Instance.Write(album);
@@ -172,36 +186,45 @@ namespace MusicPlayer.LibraryManagement
 
         public void HandleDeletedAlbums()
         {
-            Task.Run(() =>
+            // Same fix as HandleNewAlbumAdded — Parallel.ForEach with an async lambda never actually waits for the
+            // work inside it, so this was previously firing off untracked, unbounded async operations.
+            Task.Run(async () =>
             {
-                Parallel.ForEach(GetUnmappedDirectories(), async (directory) =>
+                using (var throttle = new SemaphoreSlim(Environment.ProcessorCount))
                 {
-                    try
+                    var deletionTasks = GetUnmappedDirectories().Select(async directory =>
                     {
-                        var cachedAlbum = await MongoDbClient.Instance.GetAlbumAsync(directory);
-
-                        if (cachedAlbum != null)
-                            await MongoDbClient.Instance.DeleteAlbumAsync(directory);
-
-                        var appDataPath = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN).FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), cachedAlbum?.Guid.ToString()));
-                        if (appDataPath != null)
-                            FileManager.Instance.RemoveFile(appDataPath);
-                    }
-
-                    catch (Exception ex)
-                    {
-                        await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
+                        await throttle.WaitAsync();
+                        try
                         {
-                            Severity = Severity.Error,
-                            Source = "HandleDeletedAlbums",
-                            Line = ex.Message,
-                            TimeStamp = DateTime.Now,
-                            Exception = ex
-                        });
-                        Console.WriteLine(ex.Message);
-                    }
-                    ;
-                });
+                            var cachedAlbum = await MongoDbClient.Instance.GetAlbumAsync(directory);
+
+                            if (cachedAlbum != null)
+                                await MongoDbClient.Instance.DeleteAlbumAsync(directory);
+
+                            var appDataPath = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN).FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), cachedAlbum?.Guid.ToString()));
+                            if (appDataPath != null)
+                                FileManager.Instance.RemoveFile(appDataPath);
+                        }
+                        catch (Exception ex)
+                        {
+                            await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
+                            {
+                                Severity = Severity.Error,
+                                Source = "HandleDeletedAlbums",
+                                Line = ex.Message,
+                                TimeStamp = DateTime.Now,
+                                Exception = ex
+                            });
+                            Console.WriteLine(ex.Message);
+                        }
+                        finally
+                        {
+                            throttle.Release();
+                        }
+                    });
+                    await Task.WhenAll(deletionTasks);
+                }
             });
         }
 
@@ -236,46 +259,59 @@ namespace MusicPlayer.LibraryManagement
                 ConcurrentBag<Album> albums = new ConcurrentBag<Album>();
                 MappingUpdate.DirectoryCount = directories.Count();
 
-                Parallel.ForEach(directories, directory =>
+                // Directories are processed sequentially; parallelism happens once, below, at the file level,
+                // bounded to the machine's actual logical processor count. The old code parallelized both this
+                // loop AND the file loop inside it, which oversubscribes the thread pool instead of speeding
+                // things up (two unbounded parallel levels stacked on top of each other).
+                foreach (var directory in directories)
                 {
                     MappingUpdate.Message = $"Mapping directory: {directory}";
 
                     var directoryInfo = new DirectoryInfo(directory);
                     var directoryName = directoryInfo.Name;
-                    if (_directoryExclusions.Contains(directoryName)) return;
+                    if (_directoryExclusions.Contains(directoryName)) continue;
 
                     if (string.Equals(directoryName, "Singles"))
                     {
                         var savedSinglesAlbum = databaseAlbums?.Find(dbAlbum => string.Equals(dbAlbum.Path, directory));
                         var singlesAlbum = MapSinglesAlbum(directory, savedSinglesAlbum, cachedFavouriteTracks, directoryInfo);
                         albums.Add(singlesAlbum);
-                        return;
+                        continue;
                     }
 
-                    var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories);
-                    if (!files.Any()) return;
+                    // Materialized once and reused for image lookup, the first-audio-file lookup below, and the
+                    // parallel pass — the old code enumerated the directory twice (once via .Where().ToList() for
+                    // images, once again for the Parallel.ForEach) without ever storing the result.
+                    var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories).ToList();
+                    if (!files.Any()) continue;
 
-                    Album album = null;
-                    ConcurrentBag<Track> tracks = new ConcurrentBag<Track>();
                     var savedAlbum = databaseAlbums?.Find(dbAlbum => string.Equals(dbAlbum.Path, directory));
 
                     var imageFiles = files.Where(file => _imageFileExtensions.Contains(Path.GetExtension(file))).ToList();
                     var imageFile = GetHighestResolutionImage(imageFiles);
 
+                    var firstAudioFile = files.FirstOrDefault(file => _audioFileExtensions.Contains(Path.GetExtension(file).ToLower()));
+                    if (firstAudioFile == null) continue;
 
-                    Parallel.ForEach(files, file =>
+                    // Album-level metadata is built once, deterministically, from a single designated file before
+                    // the parallel pass starts. The old code built it lazily inside the parallel loop via
+                    // "if (album == null) album = ...", which is a data race — multiple file threads could pass
+                    // that null check simultaneously and each construct a competing Album.
+                    var album = MapAlbumMetaData(new MediaInfoWrapper(firstAudioFile), firstAudioFile, savedAlbum, directoryInfo.CreationTime);
+                    ConcurrentBag<Track> tracks = new ConcurrentBag<Track>();
+
+                    Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
                     {
                         if (!_audioFileExtensions.Contains(Path.GetExtension(file).ToLower())) return;
 
                         try
                         {
                             var mediaInfo = new MediaInfoWrapper(file);
-
-                            if (album == null)
-                                album = MapAlbumMetaData(mediaInfo, file, savedAlbum, directoryInfo.CreationTime);
-
                             var savedtrack = savedAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
-                            var presetGuid = Task.Run(async () => await GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty)).GetAwaiter().GetResult();
+                            // Awaited directly instead of via Task.Run(...).GetAwaiter().GetResult() — the old code
+                            // queued a second thread-pool thread just to block-wait on it, doubling the thread cost
+                            // of every Mongo lookup on top of the Parallel.ForEach worker already blocked here.
+                            var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
                             var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
                             tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
                         }
@@ -294,9 +330,7 @@ namespace MusicPlayer.LibraryManagement
                         }
                     });
 
-
-                    if (album == null) return;
-                    if (album.Name == null || album.Artist == "Unknown") return;
+                    if (album.Name == null || album.Artist == "Unknown") continue;
 
                     if (!string.IsNullOrWhiteSpace(imageFile))
                     {
@@ -316,7 +350,7 @@ namespace MusicPlayer.LibraryManagement
                         album.NumberOfDiscs = numberOfDiscs;
 
                     MappingUpdate.MappedDirectories = albums.Count;
-                });
+                }
 
                 MappingUpdate.IsComplete = true;
                 return albums;
@@ -353,7 +387,7 @@ namespace MusicPlayer.LibraryManagement
 
         private Album MapSinglesAlbum(string directory, Album savedAlbum, List<PlaylistTrack> cachedFavouriteTracks, DirectoryInfo directoryInfo)
         {
-            var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories);
+            var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories).ToList();
 
             if (!files.Any()) return null;
 
@@ -374,7 +408,7 @@ namespace MusicPlayer.LibraryManagement
             var imageFiles = files.Where(file => _imageFileExtensions.Contains(Path.GetExtension(file))).ToList();
             var imageFile = GetHighestResolutionImage(imageFiles);
 
-            Parallel.ForEach(files, file =>
+            Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
             {
                 if (!_audioFileExtensions.Contains(Path.GetExtension(file).ToLower())) return;
 
@@ -382,7 +416,7 @@ namespace MusicPlayer.LibraryManagement
                 {
                     var mediaInfo = new MediaInfoWrapper(file);
                     var savedtrack = savedAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
-                    var presetGuid = Task.Run(async () => await GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty)).GetAwaiter().GetResult();
+                    var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
                     var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
                     tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
                 }
@@ -415,35 +449,39 @@ namespace MusicPlayer.LibraryManagement
             return album;
         }
 
-        private Album GetCreatedAlbum(string path)
+        private async Task<Album> GetCreatedAlbumAsync(string path)
         {
             var directoryInfo = new DirectoryInfo(path);
             var directoryName = directoryInfo.Name;
             if (_directoryExclusions.Contains(directoryName)) return null;
 
-            var files = Directory.EnumerateFiles(path, "*.*", SearchOption.AllDirectories);
+            var files = Directory.EnumerateFiles(path, "*.*", SearchOption.AllDirectories).ToList();
 
             if (!files.Any()) return null;
-
-            Album album = null;
-            ConcurrentBag<Track> tracks = new ConcurrentBag<Track>();
 
             var imageFiles = files.Where(file => _imageFileExtensions.Contains(Path.GetExtension(file))).ToList();
             var imageFile = GetHighestResolutionImage(imageFiles);
 
-            Parallel.ForEach(files, file =>
+            var firstAudioFile = files.FirstOrDefault(file => _audioFileExtensions.Contains(Path.GetExtension(file).ToLower()));
+            if (firstAudioFile == null) return null;
+
+            // Built once, deterministically, before the parallel pass — see GetAlbums() for why (data race).
+            var album = MapAlbumMetaData(new MediaInfoWrapper(firstAudioFile), firstAudioFile, null, directoryInfo.CreationTime);
+            ConcurrentBag<Track> tracks = new ConcurrentBag<Track>();
+
+            // Fetched once here instead of once per file — the old code queried the Favourite playlist from Mongo
+            // on every single track.
+            var cachedFavouriteTracks = (await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks;
+
+            Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
             {
                 if (!_audioFileExtensions.Contains(Path.GetExtension(file).ToLower())) return;
 
                 try
                 {
                     var mediaInfo = new MediaInfoWrapper(file);
-
-                    if (album == null)
-                        album = MapAlbumMetaData(mediaInfo, file, null, directoryInfo.CreationTime);
-
-                    var presetGuid = Task.Run(async () => await GetTrackEqualizerPresetGuidAsync(file, Guid.Empty)).GetAwaiter().GetResult();
-                    var isFavourite = Task.Run(async () => ((await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file))) ?? false).GetAwaiter().GetResult();
+                    var presetGuid = GetTrackEqualizerPresetGuidAsync(file, Guid.Empty).GetAwaiter().GetResult();
+                    var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
                     tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, null, presetGuid, isFavourite));
                 }
                 catch (Exception ex)
@@ -460,7 +498,6 @@ namespace MusicPlayer.LibraryManagement
                 }
             });
 
-            if (album == null) return null;
             if (album.Name == null || album.Artist == "Unknown") return null;
 
             if (!string.IsNullOrWhiteSpace(imageFile))
@@ -484,40 +521,38 @@ namespace MusicPlayer.LibraryManagement
 
         private Album RefreshMappedAlbum(string path, Album databaseAlbum = null, List<PlaylistTrack> cachedFavouriteTracks = null)
         {
-            var files = Directory.EnumerateFiles(path, "*.*", SearchOption.AllDirectories);
-
-            if (!files.Any()) return null;
-
-            Album album = null;
-            ConcurrentBag<Track> tracks = new ConcurrentBag<Track>();
-
-            var imageFiles = files.Where(file => _imageFileExtensions.Contains(Path.GetExtension(file))).ToList();
-            var imageFile = GetHighestResolutionImage(imageFiles);
-
+            // Checked before doing any file enumeration — the old code always walked the whole directory tree and
+            // scanned for images first, even for the "Singles" and excluded-directory cases where that work is
+            // immediately thrown away.
             if (string.Equals(path, "Singles"))
-            {
-                var singlesAlbum = MapSinglesAlbum(path, databaseAlbum, cachedFavouriteTracks, new DirectoryInfo(path));
-                album = singlesAlbum;
-                return null;
-            }
+                return MapSinglesAlbum(path, databaseAlbum, cachedFavouriteTracks, new DirectoryInfo(path));
 
             var directoryInfo = new DirectoryInfo(path);
             var directoryName = directoryInfo.Name;
             if (_directoryExclusions.Contains(directoryName)) return null;
 
-            Parallel.ForEach(files, file =>
+            var files = Directory.EnumerateFiles(path, "*.*", SearchOption.AllDirectories).ToList();
+            if (!files.Any()) return null;
+
+            var imageFiles = files.Where(file => _imageFileExtensions.Contains(Path.GetExtension(file))).ToList();
+            var imageFile = GetHighestResolutionImage(imageFiles);
+
+            var firstAudioFile = files.FirstOrDefault(file => _audioFileExtensions.Contains(Path.GetExtension(file).ToLower()));
+            if (firstAudioFile == null) return null;
+
+            // Built once, deterministically, before the parallel pass — see GetAlbums() for why (data race).
+            var album = MapAlbumMetaData(new MediaInfoWrapper(firstAudioFile), firstAudioFile, databaseAlbum, directoryInfo.CreationTime);
+            ConcurrentBag<Track> tracks = new ConcurrentBag<Track>();
+
+            Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
             {
                 if (!_audioFileExtensions.Contains(Path.GetExtension(file).ToLower())) return;
 
                 try
                 {
                     var mediaInfo = new MediaInfoWrapper(file);
-
-                    if (album == null)
-                        album = MapAlbumMetaData(mediaInfo, file, databaseAlbum, directoryInfo.CreationTime);
-
                     var savedtrack = databaseAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
-                    var presetGuid = Task.Run(async () => await GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty)).GetAwaiter().GetResult();
+                    var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
                     var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
                     tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
                 }
@@ -536,8 +571,6 @@ namespace MusicPlayer.LibraryManagement
                 }
             });
 
-
-            if (album == null) return null;
             if (album.Name == null || album.Artist == "Unknown") return null;
 
             if (!string.IsNullOrWhiteSpace(imageFile))
@@ -669,17 +702,32 @@ namespace MusicPlayer.LibraryManagement
 
         private async Task UpsertMappedAlbumsAsync(List<Album> savedAlbums, ConcurrentBag<Album> mappedAlbums)
         {
-            await Task.CompletedTask;
-
             try
             {
-                Parallel.ForEach(mappedAlbums, async (album) =>
+                // Parallel.ForEach with an async lambda doesn't wait for the async work (see HandleNewAlbumAdded /
+                // HandleDeletedAlbums) — it also meant the surrounding try/catch here could never actually observe
+                // a Mongo write failure. Bounded + genuinely awaited instead.
+                // Note: this is still N individual round trips to Mongo. A single batched BulkWriteAsync would cut
+                // that to ~1 for large libraries — worth doing as a follow-up if this shows up as a bottleneck.
+                using (var throttle = new SemaphoreSlim(Environment.ProcessorCount))
                 {
-                    if (savedAlbums.Any(dbAlbum => string.Equals(dbAlbum.Path, album.Path)))
-                        await MongoDbClient.Instance.UpdateAlbumAsync(album);
-                    else
-                        await MongoDbClient.Instance.InsertAlbumAsync(album);
-                });
+                    var upsertTasks = mappedAlbums.Select(async album =>
+                    {
+                        await throttle.WaitAsync();
+                        try
+                        {
+                            if (savedAlbums != null && savedAlbums.Any(dbAlbum => string.Equals(dbAlbum.Path, album.Path)))
+                                await MongoDbClient.Instance.UpdateAlbumAsync(album);
+                            else
+                                await MongoDbClient.Instance.InsertAlbumAsync(album);
+                        }
+                        finally
+                        {
+                            throttle.Release();
+                        }
+                    });
+                    await Task.WhenAll(upsertTasks);
+                }
             }
             catch (Exception)
             {
@@ -769,13 +817,34 @@ namespace MusicPlayer.LibraryManagement
             var directories = Directory.EnumerateDirectories(Constants.LIBRARY_DIRECTORY, "*.*", SearchOption.TopDirectoryOnly);
             var filePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
             var mappedAlbumPaths = new ConcurrentBag<string>();
-            Parallel.ForEach(filePaths, file =>
+            Parallel.ForEach(filePaths, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
             {
-                var contents = FileManager.Instance.Read(file);
-                var album = JsonConvert.DeserializeObject<Album>(contents, settings: JsonSerializationHelper.FileSerializerSettings);
-                mappedAlbumPaths.Add(album.Path);
+                var path = ReadCachedAlbumPath(file);
+                if (path != null)
+                    mappedAlbumPaths.Add(path);
             });
             return directories.Except(mappedAlbumPaths).ToList();
+        }
+
+        // Streams the cached album file and stops as soon as it finds "Path", instead of deserializing the whole
+        // Album (which includes the full Tracks list and a base64-encoded cover image). Only checking whether a
+        // directory is already mapped shouldn't cost parsing every album's artwork.
+        private string ReadCachedAlbumPath(string filePath)
+        {
+            using (var streamReader = new StreamReader(filePath))
+            using (var jsonReader = new JsonTextReader(streamReader))
+            {
+                while (jsonReader.Read())
+                {
+                    if (jsonReader.TokenType != JsonToken.PropertyName || !string.Equals((string)jsonReader.Value, nameof(Album.Path)))
+                        continue;
+
+                    jsonReader.Read();
+                    return (string)jsonReader.Value;
+                }
+
+                return null;
+            }
         }
 
         #endregion Private Functions
