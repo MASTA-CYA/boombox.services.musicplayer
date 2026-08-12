@@ -45,7 +45,26 @@ namespace MusicPlayer.Player
         private Player()
         {
             var drivers = AsioOut.GetDriverNames();
+            _logger.LogInformation("Available ASIO drivers: {Drivers}", drivers.Any() ? string.Join(", ", drivers) : "(none found)");
+
             _activeDriver = drivers.FirstOrDefault(driver => string.Equals(driver, ASIO_DRIVER));
+
+            if (_activeDriver != null)
+            {
+                _logger.LogInformation("Using ASIO driver {ActiveDriver}", _activeDriver);
+            }
+            else
+            {
+                // Previously this silently passed null into `new AsioOut(_activeDriver)` in Play() if
+                // ASIO_DRIVER wasn't found — which fails deep inside ASIO COM interop with a much less useful
+                // error than a clear log line up front. Falling back to whatever's first mirrors what the
+                // parameterless AsioOut() constructor does, so playback still has the best chance of working,
+                // but now it's visible in the logs which driver actually ended up in use instead of being a
+                // guessing game (e.g. ASIO4ALL vs. a native Focusrite driver).
+                _activeDriver = drivers.FirstOrDefault();
+                _logger.LogWarning("Configured ASIO driver \"{ConfiguredDriver}\" not found; falling back to {FallbackDriver}", ASIO_DRIVER, _activeDriver ?? "(none available)");
+            }
+
             PrepareEqualizerPresets();
         }
 
