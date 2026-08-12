@@ -48,7 +48,11 @@ namespace MusicServer.Startup
             using var timer = new PeriodicTimer(TimeSpan.FromSeconds(5));
             try
             {
-                var version = Assembly.GetEntryAssembly()?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion[..13];
+                // Was `InformationalVersion[..13]` — an arbitrary fixed-length substring that happened to roughly
+                // fit the old non-semantic "1.0.<date>.<time>" wildcard version. Now that Nerdbank.GitVersioning
+                // controls this attribute (see MusicServer/version.json), the string is a real semver like
+                // "1.2.3+a1b2c3d" and can just be sent as-is — no length assumption to keep in sync.
+                var version = Assembly.GetEntryAssembly()?.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion ?? "unknown";
                 while (await timer.WaitForNextTickAsync(token))
                     await _serverHub.Clients.All.SendAsync("ReceiveServerUpdates", version, token);
             }
