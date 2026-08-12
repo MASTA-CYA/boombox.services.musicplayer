@@ -128,7 +128,14 @@ namespace MusicPlayer.Player
             {
                 var resampler = new WdlResamplingSampleProvider(reader, SAMPLE_RATE);
                 var resampledFilename = Path.Combine(new string[] { Constants.RESAMPLED_PROVIDERS_DIRECTORY, $"{Path.GetFileNameWithoutExtension(config.Key)}.wav" });
-                WaveFileWriter.CreateWaveFile16(resampledFilename, resampler);
+
+                // Was CreateWaveFile16, which truncates every track to 16-bit PCM with no dithering regardless of
+                // source resolution — any 24-bit FLAC lost real resolution before it ever reached the Focusrite/
+                // KRKs. ToWaveProvider() keeps the resampler's output as 32-bit IEEE float, so the cache preserves
+                // full precision; only the sample rate is intentionally changed here, not bit depth. Safe to swap
+                // with no migration step: Program.cs clears RESAMPLED_PROVIDERS_DIRECTORY on every startup, so the
+                // cache regenerates in the new format automatically on next run.
+                WaveFileWriter.CreateWaveFile(resampledFilename, resampler.ToWaveProvider());
                 reSampledProviders.Add(new EnhancedAudioFileReader(serverFileName: resampledFilename, originalFileName: config.Key, equalizerPreset: config.Value));
             }
         }
@@ -259,29 +266,54 @@ namespace MusicPlayer.Player
 
         private void HandleEndOfProviderReached()
         {
-            ReachedEndOfProvider?.Invoke(this, new CurrentProviderEventArgs(_currentProvider));
-            AddQueuedProviders();
+            var finishedProvider = _currentProvider;
 
-            switch (Player.Instance.PlaybackInformation.PlayerState.Mode)
+            try
             {
-                case PlaybackMode.Shuffle:
-                    HandleShufflePlayback();
-                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset?.FrequencyBands?.ToArray());
-                    break;
-                case PlaybackMode.RepeatAll:
-                    HandleRepeatAllPlayback();
-                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset?.FrequencyBands?.ToArray());
-                    break;
-                case PlaybackMode.RepeatOne:
-                    HandleRepeatOnePlayback();
-                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset?.FrequencyBands?.ToArray());
-                    break;
-                case PlaybackMode.Sequential:
-                default:
-                    HandleSequentialPlayback();
-                    SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader).EqualizerPreset?.FrequencyBands?.ToArray());
-                    break;
+                AddQueuedProviders();
+
+                switch (Player.Instance.PlaybackInformation.PlayerState.Mode)
+                {
+                    case PlaybackMode.Shuffle:
+                        HandleShufflePlayback();
+                        break;
+                    case PlaybackMode.RepeatAll:
+                        HandleRepeatAllPlayback();
+                        break;
+                    case PlaybackMode.RepeatOne:
+                        HandleRepeatOnePlayback();
+                        break;
+                    case PlaybackMode.Sequential:
+                    default:
+                        HandleSequentialPlayback();
+                        break;
+                }
+
+                // Null-guarded: HandleSequentialPlayback sets _currentProvider to null when the playlist has
+                // genuinely ended (no next track), and control still falls through to here. The old unguarded
+                // `(_currentProvider as EnhancedAudioFileReader).EqualizerPreset` threw a NullReferenceException on
+                // every single natural end-of-playlist — this is the exact repeating crash that used to show up in
+                // Logs/error.log before Serilog made it visible.
+                SetPresetFrequencyBandGains((_currentProvider as EnhancedAudioFileReader)?.EqualizerPreset?.FrequencyBands?.ToArray());
             }
+            catch (Exception ex)
+            {
+                // This method runs synchronously on the ASIO audio callback thread — Read() needs _currentProvider
+                // updated before it continues its loop (that's what makes gapless playback across tracks work
+                // within a single Read() call), so none of this can simply be pushed onto a background thread.
+                // An unhandled exception here previously propagated straight out through Read() into NAudio's
+                // callback, which is a much worse failure mode than a graceful stop. Fail safe instead: log it and
+                // clear _currentProvider — Read() already treats a null current provider as "nothing left to
+                // play" and returns 0 samples, which AsioOut handles cleanly.
+                _logger.LogError(ex, "Unable to advance to next provider after track ended");
+                _currentProvider = null;
+            }
+
+            // Not required for Read()'s next iteration — this only feeds a fire-and-forget "times played" database
+            // update in Player.HandleReachedEndOfTrack — so it's dispatched off the audio thread instead of
+            // invoked inline like the rest of this method has to be.
+            if (finishedProvider != null)
+                Task.Run(() => ReachedEndOfProvider?.Invoke(this, new CurrentProviderEventArgs(finishedProvider)));
         }
 
         private void HandleSequentialPlayback()
