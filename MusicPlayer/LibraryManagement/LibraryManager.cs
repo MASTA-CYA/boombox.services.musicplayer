@@ -11,6 +11,7 @@ using Newtonsoft.Json;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -251,6 +252,46 @@ namespace MusicPlayer.LibraryManagement
 
         private ConcurrentBag<Album> GetAlbums(List<Album> databaseAlbums, List<PlaylistTrack> cachedFavouriteTracks)
         {
+            // Reset from any previous run so a stale IsComplete/Error doesn't linger into this one — MusicServer's
+            // MappingUpdateBroadcast treats IsComplete transitioning to true as "this run just finished, persist
+            // it," so a leftover true here would make every update in a fresh run look like a completed one.
+            MappingUpdate.IsComplete = false;
+            MappingUpdate.Error = null;
+            MappingUpdate.StartedAtUtc = DateTime.UtcNow;
+
+            var process = Process.GetCurrentProcess();
+            var lastCpuTime = process.TotalProcessorTime;
+            var lastSampleAt = DateTime.UtcNow;
+
+            // Process-level (not system-wide) CPU/memory, sampled once a second for the duration of this rescan
+            // only — bounded lifetime, stopped via Dispose() below once mapping finishes or throws. Unlike the old
+            // BroadcastController polling loop this isn't a fixed unconditional broadcast; it's a short-lived
+            // sampler feeding MappingUpdate the same way any other mutation does.
+            using (new Timer(_ =>
+            {
+                try
+                {
+                    process.Refresh();
+                    var now = DateTime.UtcNow;
+                    var cpuTime = process.TotalProcessorTime;
+
+                    var cpuTimeDeltaMs = (cpuTime - lastCpuTime).TotalMilliseconds;
+                    var wallDeltaMs = (now - lastSampleAt).TotalMilliseconds;
+                    // Normalized 0-100 (divided by logical processor count) rather than allowed to run past 100 on
+                    // a multi-core machine.
+                    var cpuPercent = wallDeltaMs > 0 ? (cpuTimeDeltaMs / wallDeltaMs / Environment.ProcessorCount) * 100 : 0;
+
+                    lastCpuTime = cpuTime;
+                    lastSampleAt = now;
+
+                    MappingUpdate.CpuPercent = Math.Round(cpuPercent, 1);
+                    MappingUpdate.MemoryMb = Math.Round(process.WorkingSet64 / 1024.0 / 1024.0, 1);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"Unable to sample resource usage: {ex.Message}");
+                }
+            }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1)))
             try
             {
                 MappingUpdate.Message = $"Mapping target directory: {Constants.LIBRARY_DIRECTORY}";

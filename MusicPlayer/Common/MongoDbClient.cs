@@ -18,6 +18,7 @@ namespace MusicPlayer.Common
         private readonly IMongoCollection<Album> _albumCollection;
         private readonly IMongoCollection<Playlist> _playlistCollection;
         private readonly IMongoCollection<EqualizerPreset> _equalizerCollection;
+        private readonly IMongoCollection<MappingStatistic> _mappingStatisticCollection;
 
         #region Singleton
         private static readonly Lazy<MongoDbClient> _instance = new Lazy<MongoDbClient>(() => new MongoDbClient());
@@ -30,6 +31,38 @@ namespace MusicPlayer.Common
             _albumCollection = _database.GetCollection<Album>("albums");
             _playlistCollection = _database.GetCollection<Playlist>("playlists");
             _equalizerCollection = _database.GetCollection<EqualizerPreset>("equalizer");
+            _mappingStatisticCollection = _database.GetCollection<MappingStatistic>("mapping_statistics");
+
+            // GetCollection<T>() above never touches the server — it's just a client-side handle. MongoDB only
+            // creates a collection on its first write, so without this, a fresh database would be missing whichever
+            // collections nothing had been inserted into yet (mapping_statistics, most likely, since it's only
+            // written at the end of a full rescan). Called directly rather than via Task.Run(...).GetAwaiter()
+            // .GetResult() — see LibraryManager's blocking-on-async fix notes for why that wrapper is wasteful.
+            EnsureCollectionsExistAsync().GetAwaiter().GetResult();
+        }
+
+        // If the constructor throws, this Lazy<T> permanently caches the exception and every future
+        // MongoDbClient.Instance access rethrows it for the rest of the process's lifetime (an app restart is
+        // needed to retry) — same as if Mongo were simply unreachable during any other startup call, just surfaced
+        // here instead.
+        private async Task EnsureCollectionsExistAsync()
+        {
+            var existingCollectionNames = new HashSet<string>(await (await _database.ListCollectionNamesAsync()).ToListAsync());
+            var expectedCollectionNames = new[] { "albums", "playlists", "equalizer", "mapping_statistics" };
+
+            foreach (var collectionName in expectedCollectionNames)
+            {
+                if (existingCollectionNames.Contains(collectionName)) continue;
+
+                try
+                {
+                    await _database.CreateCollectionAsync(collectionName);
+                }
+                catch (MongoCommandException ex) when (string.Equals(ex.CodeName, "NamespaceExists"))
+                {
+                    // Created by something else between the check above and this call — nothing to do.
+                }
+            }
         }
 
         #endregion Singleton
@@ -143,5 +176,18 @@ namespace MusicPlayer.Common
         }
 
         #endregion Playlist
+
+        #region Mapping Statistics
+        public async Task InsertMappingStatisticAsync(MappingStatistic statistic) => await _mappingStatisticCollection.InsertOneAsync(statistic);
+
+        public async Task<List<MappingStatistic>> GetMappingStatisticsAsync(int limit = 50)
+            => await _mappingStatisticCollection.Find(Builders<MappingStatistic>.Filter.Empty)
+                .SortByDescending(statistic => statistic.StartedAtUtc)
+                .Limit(limit)
+                .ToListAsync();
+
+        public async Task<MappingStatistic> GetMappingStatisticAsync(ObjectId id) => await _mappingStatisticCollection.Find(statistic => statistic.Id.Equals(id)).FirstOrDefaultAsync();
+
+        #endregion Mapping Statistics
     }
 }
