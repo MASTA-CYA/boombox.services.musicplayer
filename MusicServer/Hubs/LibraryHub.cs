@@ -20,7 +20,6 @@ namespace MusicServer.Hubs
 
             try
             {
-                await ServerHttpClient.Instance.StartMappingBroadcastAsync();
                 await SendMappingUpdate(message: "Attempting to get library mapping from cache");
                 libraryResponse = await GetLibraryResponseFromFileAsync();
             }
@@ -41,7 +40,6 @@ namespace MusicServer.Hubs
                 _ = Task.Run(async () => await SaveLibraryResponseToFileAsync(libraryResponse));
             }
 
-            await ServerHttpClient.Instance.StopMappingBroadcastAsync();
             await Clients.All.SendAsync("ReceiveLibrary", libraryResponse.ToString());
         }
 
@@ -111,20 +109,20 @@ namespace MusicServer.Hubs
             return JsonConvert.SerializeObject(library, JsonSerializationHelper.NamingSerializerSettings);
         }
 
+        // Just mutates MappingUpdate now — the Changed event (wired up once in MusicServer.Program.cs) pushes the
+        // broadcast itself, so this no longer needs to serialize/send anything directly. Kept as async Task so
+        // existing call sites don't need to change.
         private async Task SendMappingUpdate(string message = "", string error = "")
         {
-            var libraryManager = LibraryManager.Instance;
-            var mappingUpdate = libraryManager.MappingUpdate;
+            await Task.CompletedTask;
+
+            var mappingUpdate = LibraryManager.Instance.MappingUpdate;
 
             if (!string.IsNullOrWhiteSpace(message))
                 mappingUpdate.Message = message;
 
             if (!string.IsNullOrWhiteSpace(error))
                 mappingUpdate.Error = error;
-
-            var mappingUpdateJson = JsonConvert.SerializeObject(mappingUpdate, JsonSerializationHelper.NamingSerializerSettings);
-
-            await Clients.All.SendAsync("ReceiveMappingUpdate", mappingUpdateJson);
         }
 
         private async Task SaveLibraryResponseToFileAsync(string libraryResponse)

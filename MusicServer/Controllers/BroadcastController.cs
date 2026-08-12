@@ -1,6 +1,5 @@
 ﻿using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.SignalR;
-using MusicPlayer.LibraryManagement;
 using MusicPlayer.Player;
 using MusicPlayer.PlaylistManagement;
 using MusicPlayer.PlaylistManagement.Models;
@@ -13,17 +12,15 @@ namespace MusicServer.Controllers
 {
     [Route("api/[controller]")]
     [ApiController]
-    public class BroadcastController(ILogger<BroadcastController> logger, IHubContext<PlayerHub> playerHub, IHubContext<PlaylistHub> playlistHub, IHubContext<LibraryHub> libraryHub, IHubContext<ServerHub> serverHub) : ControllerBase
+    public class BroadcastController(ILogger<BroadcastController> logger, IHubContext<PlayerHub> playerHub, IHubContext<PlaylistHub> playlistHub, IHubContext<ServerHub> serverHub) : ControllerBase
     {
         private readonly ILogger<BroadcastController> _logger = logger;
         private readonly IHubContext<PlayerHub> _playerHub = playerHub;
         private readonly IHubContext<PlaylistHub> _playlistHub = playlistHub;
-        private readonly IHubContext<LibraryHub> _libraryHub = libraryHub;
         private readonly IHubContext<ServerHub> _serverHub = serverHub;
 
         private static CancellationTokenSource? _playbackToken;
         private static CancellationTokenSource? _playlistToken;
-        private static CancellationTokenSource? _libraryToken;
         private static CancellationTokenSource? _serverToken;
 
         #region Playback Information
@@ -131,48 +128,10 @@ namespace MusicServer.Controllers
 
         #endregion Playlist
 
-        #region Library Mapping
-        [HttpPost("StartMappingUpdates")]
-        public void StartmappingUpdates()
-        {
-            if (_libraryToken != null) return;
-
-            _libraryToken = new CancellationTokenSource();
-            var token = _libraryToken.Token;
-
-            Task.Run(async () => await StartMappingBroadcastAsync(token), token);
-        }
-
-        [HttpPost("StopMappingUpdates")]
-        public void StopmappingUpdates()
-        {
-            if (_libraryToken == null) return;
-
-            _libraryToken.Cancel();
-            _libraryToken.Dispose();
-            _libraryToken = null;
-        }
-
-        private async Task StartMappingBroadcastAsync(CancellationToken token)
-        {
-            using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(1));
-            try
-            {
-                while (await timer.WaitForNextTickAsync(token))
-                {
-                    var mappingUpdate = LibraryManager.Instance.MappingUpdate;
-                    var mappingUpdateJson = JsonSerializer.Serialize(mappingUpdate, JsonSerializationHelper.SerializerOptions);
-                    await _libraryHub.Clients.All.SendAsync("ReceiveMappingUpdate", mappingUpdateJson, token);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex.Message);
-                Console.WriteLine();
-            }
-        }
-
-        #endregion Library Mapping
+        // Library Mapping updates no longer go through this controller — MappingUpdate now broadcasts itself via
+        // its Changed event, wired up once at startup by MusicServer.Startup.MappingUpdateBroadcast. See
+        // KNOWN_ISSUES.md for why: the old 1ms polling timer here re-sent the same state constantly regardless of
+        // whether anything had changed.
 
         #region Server Updates
         [HttpPost("StartServerUpdates")]

@@ -2,6 +2,7 @@
 using MusicPlayer.Common;
 using MusicPlayer.FileManagement;
 using MusicServer.Hubs;
+using MusicServer.Startup;
 
 namespace MusicServer
 {
@@ -38,6 +39,7 @@ namespace MusicServer
 
             //Start up operations
             await InitializeAsync();
+            MappingUpdateBroadcast.Initialize(app);
 
             // Configure the HTTP request pipeline.
             if (app.Environment.IsDevelopment())
