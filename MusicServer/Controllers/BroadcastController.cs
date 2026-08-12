@@ -62,8 +62,7 @@ namespace MusicServer.Controllers
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex.Message);
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Playback information broadcast loop failed");
                 Player.Instance.RestartPlaybackBroadcast();
             }
         }
@@ -121,8 +120,7 @@ namespace MusicServer.Controllers
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex.Message);
-                Console.WriteLine();
+                _logger.LogError(ex, "Playlist broadcast loop failed");
             }
         }
 
@@ -166,8 +164,7 @@ namespace MusicServer.Controllers
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex.Message);
-                Console.WriteLine();
+                _logger.LogError(ex, "Server status broadcast loop failed");
             }
         }
 

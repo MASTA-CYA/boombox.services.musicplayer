@@ -3,7 +3,6 @@ using MusicPlayer.Common;
 using MusicPlayer.FileManagement;
 using MusicPlayer.LibraryManagement;
 using MusicPlayer.LibraryManagement.Models;
-using MusicPlayer.Models;
 using MusicServer.Helpers;
 using Newtonsoft.Json;
 using StackExchange.Redis;
@@ -11,8 +10,10 @@ using System.Collections.Concurrent;
 
 namespace MusicServer.Hubs
 {
-    public class LibraryHub : Hub
+    public class LibraryHub(ILogger<LibraryHub> logger) : Hub
     {
+        private readonly ILogger<LibraryHub> _logger = logger;
+
         #region Public Methods
         public async Task GetLibraryAsync()
         {
@@ -25,14 +26,7 @@ namespace MusicServer.Hubs
             }
             catch (Exception ex)
             {
-                _ = Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetLibraryAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
+                _logger.LogError(ex, "Unable to get library mapping from cache");
                 await SendMappingUpdate(error: ex.Message);
                 await SendMappingUpdate(message: "Unable to get library mapping from cache");
 
@@ -69,15 +63,7 @@ namespace MusicServer.Hubs
             }
             catch (Exception ex)
             {
-                _ = Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetSelectedAlbumAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to get selected album");
                 return LibraryManager.Instance.SelectedAlbum;
             }
         }
@@ -135,19 +121,12 @@ namespace MusicServer.Hubs
             }
             catch (Exception ex)
             {
-                _ = Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "SaveLibraryResponseToFileAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine($"Unable to save album to file: {ex.Message}");
+                _logger.LogError(ex, "Unable to save album to file");
             }
         }
 
-        private static async Task<string> GetLibraryResponseFromFileAsync()
+        // No longer static — it needs the injected _logger, which is instance state.
+        private async Task<string> GetLibraryResponseFromFileAsync()
         {
             try
             {
@@ -174,15 +153,7 @@ namespace MusicServer.Hubs
             }
             catch (Exception ex)
             {
-                _ = Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetLibraryResponseFromFileAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine($"Unable to get saved albums: {ex.Message}");
+                _logger.LogError(ex, "Unable to get saved albums");
                 throw;
             }
         }

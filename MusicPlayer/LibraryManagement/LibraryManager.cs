@@ -1,10 +1,10 @@
 ﻿using MediaInfo;
+using Microsoft.Extensions.Logging;
 using MongoDB.Bson;
 using MusicPlayer.Common;
 using MusicPlayer.FileManagement;
 using MusicPlayer.Helpers;
 using MusicPlayer.LibraryManagement.Models;
-using MusicPlayer.Models;
 using MusicPlayer.PlaylistManagement.Models;
 using NAudio.Wave;
 using Newtonsoft.Json;
@@ -22,6 +22,8 @@ namespace MusicPlayer.LibraryManagement
 {
     public sealed class LibraryManager
     {
+        private static readonly ILogger _logger = AppLogger.CreateLogger<LibraryManager>();
+
         private readonly List<string> _audioFileExtensions = new List<string> { ".mp3", ".wav", ".flac", ".m4a" };
         private readonly List<string> _imageFileExtensions = new List<string> { ".png", ".jpg", ".webp", ".jpeg" };
         private readonly List<string> _directoryExclusions = new List<string> { "beats", "Edits", "iTunes", "Playlists", "Dump", "Resampled Providers", "Staging" };
@@ -129,15 +131,7 @@ namespace MusicPlayer.LibraryManagement
             }
             catch (Exception ex)
             {
-                await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "UpdateIsFavoriteTrackAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to update favourite state for {Path}", path);
             }
         }
 
@@ -173,15 +167,7 @@ namespace MusicPlayer.LibraryManagement
             }
             catch (Exception ex)
             {
-                await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "MapCreatedAlbumAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to map newly created album at {Path}", path);
             }
         }
 
@@ -209,15 +195,7 @@ namespace MusicPlayer.LibraryManagement
                         }
                         catch (Exception ex)
                         {
-                            await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                            {
-                                Severity = Severity.Error,
-                                Source = "HandleDeletedAlbums",
-                                Line = ex.Message,
-                                TimeStamp = DateTime.Now,
-                                Exception = ex
-                            });
-                            Console.WriteLine(ex.Message);
+                            _logger.LogError(ex, "Unable to handle deleted album at {Path}", directory);
                         }
                         finally
                         {
@@ -289,7 +267,7 @@ namespace MusicPlayer.LibraryManagement
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine($"Unable to sample resource usage: {ex.Message}");
+                    _logger.LogWarning(ex, "Unable to sample resource usage");
                 }
             }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1)))
             try
@@ -358,16 +336,8 @@ namespace MusicPlayer.LibraryManagement
                         }
                         catch (Exception ex)
                         {
-                            Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                            {
-                                Severity = Severity.Error,
-                                Source = "GetAlbums",
-                                Line = ex.Message,
-                                TimeStamp = DateTime.Now,
-                                Exception = ex
-                            }));
+                            _logger.LogError(ex, "Unable to map metadata for {FilePath}", file);
                             MappingUpdate.Error = $"Unable to map metadata: {ex.Message}";
-                            Console.WriteLine($"Unable to map metadata: {ex.Message}");
                         }
                     });
 
@@ -398,30 +368,14 @@ namespace MusicPlayer.LibraryManagement
             }
             catch (UnauthorizedAccessException ex)
             {
-                Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetAlbums",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
+                _logger.LogError(ex, "Access denied while mapping library");
                 MappingUpdate.Error = $"Access denied: {ex.Message}";
-                Console.WriteLine($"Access denied: {ex.Message}");
                 throw;
             }
             catch (DirectoryNotFoundException ex)
             {
-                Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetAlbums",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
+                _logger.LogError(ex, "Directory not found while mapping library");
                 MappingUpdate.Error = $"Directory not found: {ex.Message}";
-                Console.WriteLine($"Directory not found: {ex.Message}");
                 throw;
             }
         }
@@ -463,16 +417,8 @@ namespace MusicPlayer.LibraryManagement
                 }
                 catch (Exception ex)
                 {
-                    Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                    {
-                        Severity = Severity.Error,
-                        Source = "MapSinglesAlbum",
-                        Line = ex.Message,
-                        TimeStamp = DateTime.Now,
-                        Exception = ex
-                    }));
+                    _logger.LogError(ex, "Unable to map metadata for {FilePath}", file);
                     MappingUpdate.Error = $"Unable to map metadata: {ex.Message}";
-                    Console.WriteLine($"Unable to map metadata: {ex.Message}");
                 }
             });
 
@@ -527,15 +473,7 @@ namespace MusicPlayer.LibraryManagement
                 }
                 catch (Exception ex)
                 {
-                    Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                    {
-                        Severity = Severity.Error,
-                        Source = "GetCreatedAlbum",
-                        Line = ex.Message,
-                        TimeStamp = DateTime.Now,
-                        Exception = ex
-                    }));
-                    Console.WriteLine($"Unable to map metadata: {ex.Message}");
+                    _logger.LogError(ex, "Unable to map metadata for {FilePath}", file);
                 }
             });
 
@@ -599,16 +537,8 @@ namespace MusicPlayer.LibraryManagement
                 }
                 catch (Exception ex)
                 {
-                    Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                    {
-                        Severity = Severity.Error,
-                        Source = "GetAlbums",
-                        Line = ex.Message,
-                        TimeStamp = DateTime.Now,
-                        Exception = ex
-                    }));
+                    _logger.LogError(ex, "Unable to map metadata for {FilePath}", file);
                     MappingUpdate.Error = $"Unable to map metadata: {ex.Message}";
-                    Console.WriteLine($"Unable to map metadata: {ex.Message}");
                 }
             });
 
@@ -751,9 +681,9 @@ namespace MusicPlayer.LibraryManagement
                 // since every album here already has its Id set correctly by the caller.
                 await MongoDbClient.Instance.UpsertAlbumsAsync(mappedAlbums);
             }
-            catch (Exception)
+            catch (Exception ex)
             {
-                Console.WriteLine("Unable to upsert albums to database");
+                _logger.LogError(ex, "Unable to upsert albums to database");
                 throw;
             }
         }
@@ -777,14 +707,7 @@ namespace MusicPlayer.LibraryManagement
             }
             catch (Exception ex)
             {
-                await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetCachedDatabaseAlbumsAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
+                _logger.LogError(ex, "Unable to get cached database albums");
                 MappingUpdate.Error = ex.Message;
                 return null;
             }
@@ -798,14 +721,7 @@ namespace MusicPlayer.LibraryManagement
             }
             catch (Exception ex)
             {
-                await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetCachedDatabaseAlbumsAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
+                _logger.LogError(ex, "Unable to get cached database album at {Path}", path);
                 MappingUpdate.Error = ex.Message;
                 return null;
             }
@@ -821,14 +737,7 @@ namespace MusicPlayer.LibraryManagement
             }
             catch (Exception ex)
             {
-                await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetTrackEqualizerPresetAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
+                _logger.LogError(ex, "Unable to get equalizer preset for {Path}", path);
                 MappingUpdate.Error = ex.Message;
                 return Guid.Empty;
             }

@@ -1,6 +1,6 @@
-﻿using MusicPlayer.Helpers;
+﻿using Microsoft.Extensions.Logging;
+using MusicPlayer.Helpers;
 using MusicPlayer.LibraryManagement.Models;
-using MusicPlayer.Models;
 using Newtonsoft.Json;
 using System;
 using System.Net.Http;
@@ -18,7 +18,8 @@ namespace MusicPlayer.Common
         private const string START_SERVER_STATUS_UPDATES = "Broadcast/StartServerUpdates";
         private const string STOP_SERVER_STATUS_UPDATES = "Broadcast/StopServerUpdates";
         private const string POST_TRACK_USER_DATA = "MetaData/UpdateTrackUserData";
-        private const string POST_LOG_ENTRY = "Logging/LogEntry";
+
+        private static readonly ILogger _logger = AppLogger.CreateLogger<ServerHttpClient>();
 
         private readonly HttpClient _httpClient;
 
@@ -36,20 +37,6 @@ namespace MusicPlayer.Common
 
         #endregion Singleton
 
-        public async Task LogEntryAsync(LogEntry entry)
-        {
-            try
-            {
-                var json = JsonConvert.SerializeObject(entry, JsonSerializationHelper.NamingSerializerSettings);
-                var content = new StringContent(json, Encoding.UTF8, "application/json");
-                await _httpClient.PostAsync($"api/{POST_LOG_ENTRY}", content);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine(ex.Message);
-            }
-        }
-
         public async Task StartPlaybackInformationBroadcastAsync()
         {
             try
@@ -58,15 +45,7 @@ namespace MusicPlayer.Common
             }
             catch (Exception ex)
             {
-                await LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "StartPlaybackInformationBroadcastAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to start playback information broadcast");
             }
         }
 
@@ -78,15 +57,7 @@ namespace MusicPlayer.Common
             }
             catch (Exception ex)
             {
-                await LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "StopPlaybackInformationBroadcastAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to stop playback information broadcast");
             }
         }
 
@@ -98,15 +69,7 @@ namespace MusicPlayer.Common
             }
             catch (Exception ex)
             {
-                await LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "StartPlaylistBroadcastAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to start playlist broadcast");
             }
         }
 
@@ -118,15 +81,7 @@ namespace MusicPlayer.Common
             }
             catch (Exception ex)
             {
-                await LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "StopPlaylistBroadcastAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to stop playlist broadcast");
             }
         }
 
@@ -140,15 +95,7 @@ namespace MusicPlayer.Common
             }
             catch (Exception ex)
             {
-                await LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "UpdateTrackerUserDataAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to update track user data for {TrackPath}", data?.Path);
             }
         }
 
@@ -160,15 +107,7 @@ namespace MusicPlayer.Common
             }
             catch (Exception ex)
             {
-                await LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "StartServerStatusUpdatesAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to start server status updates");
             }
         }
 
@@ -180,15 +119,7 @@ namespace MusicPlayer.Common
             }
             catch (Exception ex)
             {
-                await LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "StopServerStatusUpdatesAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to stop server status updates");
             }
         }
     }

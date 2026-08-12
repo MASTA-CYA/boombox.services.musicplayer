@@ -1,9 +1,9 @@
-﻿using MusicPlayer.Common;
+﻿using Microsoft.Extensions.Logging;
+using MusicPlayer.Common;
 using MusicPlayer.FileManagement;
 using MusicPlayer.Helpers;
 using MusicPlayer.LibraryManagement;
 using MusicPlayer.LibraryManagement.Models;
-using MusicPlayer.Models;
 using MusicPlayer.Player.Models;
 using MusicPlayer.PlaylistManagement.Models;
 using NAudio.Wave;
@@ -20,6 +20,8 @@ namespace MusicPlayer.Player
     public sealed class Player : IDisposable
     {
         private const string ASIO_DRIVER = "Focusrite USB ASIO";
+
+        private static readonly ILogger _logger = AppLogger.CreateLogger<Player>();
 
         private readonly string _activeDriver;
         private AsioOut _audioPlayer;
@@ -190,15 +192,7 @@ namespace MusicPlayer.Player
                 }
                 catch (Exception ex)
                 {
-                    Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                    {
-                        Severity = Severity.Error,
-                        Source = "UpdatePlaybackInformation",
-                        Line = ex.Message,
-                        TimeStamp = DateTime.Now,
-                        Exception = ex
-                    }));
-                    Console.WriteLine(ex.Message);
+                    _logger.LogError(ex, "Unable to update playback information");
                 }
             }
         }
@@ -309,15 +303,7 @@ namespace MusicPlayer.Player
             }
             catch (Exception ex)
             {
-                await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "SaveEqualizerPresetAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                });
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to save equalizer preset");
             }
         }
 

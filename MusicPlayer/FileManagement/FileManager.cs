@@ -1,7 +1,7 @@
-﻿using MusicPlayer.Common;
+﻿using Microsoft.Extensions.Logging;
+using MusicPlayer.Common;
 using MusicPlayer.FileManagement.Interfaces;
 using MusicPlayer.LibraryManagement;
-using MusicPlayer.Models;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -13,6 +13,8 @@ namespace MusicPlayer.FileManagement
 {
     public sealed class FileManager : IDisposable
     {
+        private static readonly ILogger _logger = AppLogger.CreateLogger<FileManager>();
+
         private readonly string _appDataDirectory;
         private readonly FileSystemWatcher _watcher;
         private readonly Debouncer _debouncer;
@@ -82,15 +84,7 @@ namespace MusicPlayer.FileManagement
             }
             catch (Exception ex)
             {
-                Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "ClearDirectory",
-                    Line = ex.ToString(),
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to clear directory {Path}", path ?? _appDataDirectory);
             }
         }
 
@@ -107,15 +101,7 @@ namespace MusicPlayer.FileManagement
             }
             catch (Exception ex)
             {
-                Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "RemoveDirectory",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to remove directory {Path}", path ?? _appDataDirectory);
             }
         }
 
@@ -130,15 +116,7 @@ namespace MusicPlayer.FileManagement
             }
             catch (Exception ex)
             {
-                Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "RemoveFile",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to remove file {Path}", path);
             }
         }
 
@@ -155,15 +133,7 @@ namespace MusicPlayer.FileManagement
                 }
                 catch (Exception ex)
                 {
-                    Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                    {
-                        Severity = Severity.Error,
-                        Source = "RemoveFile",
-                        Line = ex.Message,
-                        TimeStamp = DateTime.Now,
-                        Exception = ex
-                    }));
-                    Console.WriteLine(ex.Message);
+                    _logger.LogError(ex, "Unable to remove file {Path}", path);
                 }
             }
         }
@@ -182,15 +152,7 @@ namespace MusicPlayer.FileManagement
 
         private void OnError(object sender, ErrorEventArgs e)
         {
-            Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-            {
-                Severity = Severity.Error,
-                Source = "ClearDirectory",
-                Line = e.GetException().Message,
-                TimeStamp = DateTime.Now,
-                Exception = e.GetException()
-            }));
-            Console.WriteLine(e.GetException());
+            _logger.LogError(e.GetException(), "FileSystemWatcher raised an error");
         }
 
         private void Dispose(bool disposing)

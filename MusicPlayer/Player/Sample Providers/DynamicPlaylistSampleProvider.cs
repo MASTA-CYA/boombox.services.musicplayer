@@ -1,7 +1,7 @@
-﻿using MusicPlayer.Common;
+﻿using Microsoft.Extensions.Logging;
+using MusicPlayer.Common;
 using MusicPlayer.Extensions;
 using MusicPlayer.FileManagement;
-using MusicPlayer.Models;
 using MusicPlayer.Player.Models;
 using NAudio.Dsp;
 using NAudio.Wave;
@@ -18,6 +18,8 @@ namespace MusicPlayer.Player
     {
         private const int SAMPLE_RATE = 44100;
         private const float BAND_WIDTH_Q = 1.414f;
+
+        private static readonly ILogger _logger = AppLogger.CreateLogger<DynamicPlaylistSampleProvider>();
 
         private PeekingEnumerator<ISampleProvider> _enumerator;
         private IEnumerable<QueuedProviderInstruction> _queuedProviders;
@@ -97,15 +99,7 @@ namespace MusicPlayer.Player
             }
             catch (Exception ex)
             {
-                Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "SetPresetFrequencyBandGains",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine(ex);
+                _logger.LogError(ex, "Unable to set preset frequency band gains");
             }
 
 
@@ -225,15 +219,7 @@ namespace MusicPlayer.Player
             }
             catch (Exception ex)
             {
-                Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "AddProviders",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine(ex);
+                _logger.LogError(ex, "Unable to add providers");
             }
         }
 

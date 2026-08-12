@@ -26,6 +26,7 @@ namespace MusicServer.Startup
         public static void Initialize(WebApplication app)
         {
             var libraryHubContext = app.Services.GetRequiredService<IHubContext<LibraryHub>>();
+            var logger = app.Services.GetRequiredService<ILoggerFactory>().CreateLogger("MusicServer.Startup.MappingUpdateBroadcast");
             var mappingUpdate = LibraryManager.Instance.MappingUpdate;
 
             // MappingUpdate.Changed can fire from several different threads in close succession (the mapping
@@ -97,7 +98,7 @@ namespace MusicServer.Startup
                 }
                 catch (Exception ex)
                 {
-                    Console.WriteLine(ex.Message);
+                    logger.LogError(ex, "Unable to broadcast/persist mapping update");
                 }
             };
         }

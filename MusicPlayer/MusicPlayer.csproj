@@ -211,10 +211,9 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Common\AppLogger.cs" />
     <Compile Include="Common\Constants.cs" />
     <Compile Include="Common\Debouncer.cs" />
-    <Compile Include="Common\Models\LogEntry.cs" />
-    <Compile Include="Common\Models\Severity.cs" />
     <Compile Include="Common\MongoDbClient.cs" />
     <Compile Include="Common\ServerHttpClient.cs" />
     <Compile Include="Extensions\DictionaryExtensions.cs" />
