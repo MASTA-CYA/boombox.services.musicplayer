@@ -33,6 +33,12 @@ namespace MusicPlayer.LibraryManagement
 
         public event EventHandler<FavouriteTrackEventArgs> UpdatedFavouriteTrack;
 
+        // MusicPlayer can't reference MusicServer's SignalR hubs directly (circular project reference), so this is
+        // raised instead of the old self-HTTP-POST through ServerHttpClient/MetaDataController — same bridge
+        // pattern as MappingUpdate.Changed and Player.PlaybackBroadcastStopRequested. Subscribed once at startup by
+        // MusicServer/Startup/TrackUserDataBroadcast.cs.
+        public event EventHandler<TrackUserData> TrackUserDataChanged;
+
 
         #region Singleton
         private static readonly Lazy<LibraryManager> _instance = new Lazy<LibraryManager>(() => new LibraryManager());
@@ -691,7 +697,7 @@ namespace MusicPlayer.LibraryManagement
         private async Task UpdateTrackUserDataAsync(string path)
         {
             var track = await MongoDbClient.Instance.GetTrackAsync(albumPath: Path.GetDirectoryName(path), trackPath: path);
-            await ServerHttpClient.Instance.UpdateTrackerUserDataAsync(new TrackUserData
+            TrackUserDataChanged?.Invoke(this, new TrackUserData
             {
                 Path = path,
                 IsFavourite = track.IsFavourite,

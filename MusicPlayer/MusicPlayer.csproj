@@ -215,7 +215,6 @@
     <Compile Include="Common\Constants.cs" />
     <Compile Include="Common\Debouncer.cs" />
     <Compile Include="Common\MongoDbClient.cs" />
-    <Compile Include="Common\ServerHttpClient.cs" />
     <Compile Include="Extensions\DictionaryExtensions.cs" />
     <Compile Include="Extensions\ListExtensions.cs" />
     <Compile Include="Extensions\SampleProviderExtensions.cs" />

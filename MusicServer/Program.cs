@@ -89,6 +89,10 @@ namespace MusicServer
                 //Start up operations
                 await InitializeAsync();
                 MappingUpdateBroadcast.Initialize(app);
+                PlaybackBroadcast.Initialize(app);
+                PlaylistBroadcast.Initialize(app);
+                ServerStatusBroadcast.Initialize(app);
+                TrackUserDataBroadcast.Initialize(app);
 
                 // Configure the HTTP request pipeline.
                 if (app.Environment.IsDevelopment())

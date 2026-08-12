@@ -1,8 +1,8 @@
 ﻿using Microsoft.AspNetCore.SignalR;
-using MusicPlayer.Common;
 using MusicPlayer.PlaylistManagement;
 using MusicPlayer.PlaylistManagement.Models;
 using MusicServer.Helpers;
+using MusicServer.Startup;
 using System.Text.Json;
 
 namespace MusicServer.Hubs
@@ -34,13 +34,13 @@ namespace MusicServer.Hubs
         public async Task StartPlayingUpdatesAsync()
         {
             await Task.CompletedTask;
-            _ = Task.Run(ServerHttpClient.Instance.StartPlaylistBroadcastAsync);
+            PlaylistBroadcast.Start();
         }
 
         public async Task StopPlayingUpdatesAsync()
         {
             await Task.CompletedTask;
-            _ = Task.Run(ServerHttpClient.Instance.StopPlaylistBroadcastAsync);
+            PlaylistBroadcast.Stop();
         }
     }
 }

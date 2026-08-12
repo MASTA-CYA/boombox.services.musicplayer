@@ -1,8 +1,8 @@
 ﻿using Microsoft.AspNetCore.SignalR;
-using MusicPlayer.Common;
 using MusicPlayer.Player;
 using MusicPlayer.Player.Models;
 using MusicServer.Helpers;
+using MusicServer.Startup;
 using Newtonsoft.Json;
 using System.Runtime.Versioning;
 
@@ -27,7 +27,7 @@ namespace MusicServer.Hubs
             else
                 ExecuteOnPlayerThread(() => PlayAudioFiles(paths));
 
-            _ = Task.Run(ServerHttpClient.Instance.StartPlaybackInformationBroadcastAsync);
+            PlaybackBroadcast.Start();
             await Task.CompletedTask;
         }
 

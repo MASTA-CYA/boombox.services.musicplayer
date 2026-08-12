@@ -197,11 +197,18 @@ namespace MusicPlayer.Player
             }
         }
 
+        // Raised (after a 2s debounce) once the playlist genuinely finishes, so MusicServer can stop its playback
+        // broadcast loop. MusicPlayer can't reference MusicServer's PlaybackBroadcast class directly (would be
+        // circular), so this uses the same plain-event bridge as MappingUpdate.Changed and AppLogger — MusicServer
+        // subscribes once at startup in PlaybackBroadcast.Initialize. Replaces the old self-HTTP-POST back into
+        // BroadcastController's own StopPlaybackInformation endpoint.
+        public event EventHandler PlaybackBroadcastStopRequested;
+
         public void HandleReachedEndOfPlaylist(object sender, ProviderPathsEventArgs e)
         {
             _playbackInformation.HasReachedEndOfPlaylist = true;
             _ = Task.Run(() => new Debouncer().Debounce(ResetPlaylistElementsAsync, 2000));
-            _ = Task.Run(async () => await new Debouncer().DebounceAsync(token => StopPlaybackInformationUpdatesAsync(), 2000));
+            _ = Task.Run(async () => await new Debouncer().DebounceAsync(token => RaisePlaybackBroadcastStopRequested(), 2000));
             _ = Task.Run(() => new Debouncer().Debounce(() => Parallel.ForEach(e.Providers, provider => FileManager.Instance.RemoveFile((provider as EnhancedAudioFileReader).ServerFilepath)), 5000));
         }
 
@@ -219,8 +226,11 @@ namespace MusicPlayer.Player
             _queuedPlaylist = null;
         }
 
-        private async Task StopPlaybackInformationUpdatesAsync()
-            => await ServerHttpClient.Instance.StopPlaybackInformationBroadcastAsync();
+        private Task RaisePlaybackBroadcastStopRequested()
+        {
+            PlaybackBroadcastStopRequested?.Invoke(this, EventArgs.Empty);
+            return Task.CompletedTask;
+        }
 
         private void HandleQueuedProvidersAdded(object sender, EventArgs e)
         {
@@ -232,16 +242,6 @@ namespace MusicPlayer.Player
             var queuedTrack = _queuedPlaylist.FirstOrDefault(track => string.Equals(track.Path, e.FilePath));
             if (queuedTrack == null) return;
             queuedTrack.IsFavourite = e.IsFavourite;
-        }
-
-        public void RestartPlaybackBroadcast()
-        {
-            if (!PlaybackInformation.PlayerState.IsPlaying) return;
-            Task.Run(async () =>
-            {
-                await ServerHttpClient.Instance.StopPlaybackInformationBroadcastAsync();
-                await ServerHttpClient.Instance.StartPlaybackInformationBroadcastAsync();
-            });
         }
 
         public void ApplyEqualizerPreset(EqualizerPreset preset)
