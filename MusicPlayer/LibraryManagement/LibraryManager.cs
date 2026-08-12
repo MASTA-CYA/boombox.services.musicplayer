@@ -48,7 +48,7 @@ namespace MusicPlayer.LibraryManagement
             var databaseAlbums = await GetCachedDatabaseAlbumsAsync();
             var cachedFavouriteTracks = (await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks;
             var mappedAlbums = await Task.Run(() => GetAlbums(databaseAlbums, cachedFavouriteTracks));
-            _ = Task.Run(async () => await UpsertMappedAlbumsAsync(databaseAlbums, mappedAlbums));
+            _ = Task.Run(async () => await UpsertMappedAlbumsAsync(mappedAlbums));
             return mappedAlbums.ToList();
         }
 
@@ -241,7 +241,7 @@ namespace MusicPlayer.LibraryManagement
 
             var mappedAlbum = RefreshMappedAlbum(path, databaseAlbum, cachedFavouriteTracks);
             SelectedAlbum = JsonConvert.SerializeObject(mappedAlbum, JsonSerializationHelper.NamingSerializerSettings);
-            _ = Task.Run(async () => await UpsertMappedAlbumsAsync(new List<Album> { databaseAlbum }, new ConcurrentBag<Album> { mappedAlbum }));
+            _ = Task.Run(async () => await UpsertMappedAlbumsAsync(new ConcurrentBag<Album> { mappedAlbum }));
             _ = Task.Run(() => FileManager.Instance.Write(mappedAlbum));
         }
 
@@ -700,34 +700,15 @@ namespace MusicPlayer.LibraryManagement
                 || fileName.StartsWith("folder", StringComparison.OrdinalIgnoreCase);
         }
 
-        private async Task UpsertMappedAlbumsAsync(List<Album> savedAlbums, ConcurrentBag<Album> mappedAlbums)
+        private async Task UpsertMappedAlbumsAsync(ConcurrentBag<Album> mappedAlbums)
         {
             try
             {
-                // Parallel.ForEach with an async lambda doesn't wait for the async work (see HandleNewAlbumAdded /
-                // HandleDeletedAlbums) — it also meant the surrounding try/catch here could never actually observe
-                // a Mongo write failure. Bounded + genuinely awaited instead.
-                // Note: this is still N individual round trips to Mongo. A single batched BulkWriteAsync would cut
-                // that to ~1 for large libraries — worth doing as a follow-up if this shows up as a bottleneck.
-                using (var throttle = new SemaphoreSlim(Environment.ProcessorCount))
-                {
-                    var upsertTasks = mappedAlbums.Select(async album =>
-                    {
-                        await throttle.WaitAsync();
-                        try
-                        {
-                            if (savedAlbums != null && savedAlbums.Any(dbAlbum => string.Equals(dbAlbum.Path, album.Path)))
-                                await MongoDbClient.Instance.UpdateAlbumAsync(album);
-                            else
-                                await MongoDbClient.Instance.InsertAlbumAsync(album);
-                        }
-                        finally
-                        {
-                            throttle.Release();
-                        }
-                    });
-                    await Task.WhenAll(upsertTasks);
-                }
+                // A single batched BulkWriteAsync instead of one InsertOneAsync/ReplaceOneAsync call per album.
+                // The old insert-vs-update decision (checking mappedAlbums against a separately-passed list of
+                // already-saved albums) is now handled entirely inside UpsertAlbumsAsync via an Id-based upsert,
+                // since every album here already has its Id set correctly by the caller.
+                await MongoDbClient.Instance.UpsertAlbumsAsync(mappedAlbums);
             }
             catch (Exception)
             {

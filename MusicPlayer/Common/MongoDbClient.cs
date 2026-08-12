@@ -76,6 +76,26 @@ namespace MusicPlayer.Common
             return (isFavourite: track.IsFavourite, guid: album.Guid.ToString());
         }
 
+        // Replaces InsertOneAsync/ReplaceOneAsync-per-album with a single batched write. Every album passed in
+        // already has its Id set correctly by the caller (either the existing document's Id, or a freshly
+        // generated one for a new album — see LibraryManager.MapAlbumMetaData callers), so a plain Id-filtered
+        // upsert is enough; there's no need to separately decide insert vs. update here.
+        public async Task UpsertAlbumsAsync(IEnumerable<Album> albums)
+        {
+            var writeModels = albums
+                .Where(album => album != null)
+                .Select(album =>
+                {
+                    var filter = Builders<Album>.Filter.Eq(filteredAlbum => filteredAlbum.Id, album.Id);
+                    return (WriteModel<Album>)new ReplaceOneModel<Album>(filter, album) { IsUpsert = true };
+                })
+                .ToList();
+
+            if (writeModels.Count == 0) return;
+
+            await _albumCollection.BulkWriteAsync(writeModels);
+        }
+
         public async Task<List<Album>> GetAlbumsAsync() => await _albumCollection.Find(Builders<Album>.Filter.Empty).ToListAsync();
 
         public async Task<Album> GetAlbumAsync(ObjectId id) => await _albumCollection.Find(album => album.Id.Equals(id)).FirstOrDefaultAsync();
