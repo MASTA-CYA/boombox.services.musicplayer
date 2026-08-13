@@ -33,6 +33,7 @@ namespace MusicPlayer.Player
 
         private readonly string _activeDriver;
         private AudioOutput _activeOutput;
+        private PlaybackMode _activeMode;
         private IWavePlayer _audioPlayer;
         private DynamicPlaylistSampleProvider _playlistProvider;
         private List<PlaylistTrack> _queuedPlaylist;
@@ -74,8 +75,8 @@ namespace MusicPlayer.Player
                 _logger.LogWarning("Configured ASIO driver \"{ConfiguredDriver}\" not found; falling back to {FallbackDriver}", ASIO_DRIVER, _activeDriver ?? "(none available)");
             }
 
-            _activeOutput = LoadPlayerSettingsAsync().GetAwaiter().GetResult();
-            _logger.LogInformation("Starting with audio output {AudioOutput}", _activeOutput);
+            (_activeOutput, _activeMode) = LoadPlayerSettingsAsync().GetAwaiter().GetResult();
+            _logger.LogInformation("Starting with audio output {AudioOutput}, playback mode {PlaybackMode}", _activeOutput, _activeMode);
 
             PrepareEqualizerPresets();
         }
@@ -88,6 +89,7 @@ namespace MusicPlayer.Player
 
             _queuedPlaylist = new List<PlaylistTrack>();
             _playbackInformation = new PlaybackInformation();
+            ApplyPersistedSettingsToPlayerState();
             _isInitialized = true;
             LibraryManager.Instance.UpdatedFavouriteTrack += HandleUpdatedFavouriteTrack;
         }
@@ -97,6 +99,7 @@ namespace MusicPlayer.Player
             if (!_isInitialized) InitializePlayer();
 
             _playbackInformation = new PlaybackInformation();
+            ApplyPersistedSettingsToPlayerState();
             _queuedPlaylist = new List<PlaylistTrack>(paths.Select(LibraryManager.Instance.GetTrackInformation));
 
             var trackConfigurations = _queuedPlaylist.ToDictionary(track => track.Path, Track => Track.EqualizerPreset);
@@ -189,17 +192,30 @@ namespace MusicPlayer.Player
             return new AsioOut(_activeDriver);
         }
 
-        private async Task<AudioOutput> LoadPlayerSettingsAsync()
+        // _playbackInformation gets replaced wholesale (`new PlaybackInformation()`) in both InitializePlayer()
+        // and Play(), which resets PlayerState back to its class defaults (Speakers/Sequential) regardless of
+        // what's actually persisted/active. Previously the only thing that corrected this was
+        // UpdatePlaybackInformation()'s background task - not guaranteed to have run yet by the time a client
+        // asks for a fresh snapshot right after connecting/refreshing, so a reload could briefly (or not so
+        // briefly) show the wrong output/mode even though playback itself was already using the right one.
+        // Calling this immediately after each reset makes the broadcast correct from the very first snapshot.
+        private void ApplyPersistedSettingsToPlayerState()
+        {
+            _playbackInformation.PlayerState.AudioOutput = _activeOutput;
+            _playbackInformation.PlayerState.Mode = _activeMode;
+        }
+
+        private async Task<(AudioOutput AudioOutput, PlaybackMode Mode)> LoadPlayerSettingsAsync()
         {
             try
             {
                 var settings = await MongoDbClient.Instance.GetPlayerSettingsAsync();
-                return settings?.AudioOutput ?? AudioOutput.Speakers;
+                return (settings?.AudioOutput ?? AudioOutput.Speakers, settings?.Mode ?? PlaybackMode.Sequential);
             }
             catch (Exception ex)
             {
-                _logger.LogError(ex, "Unable to load player settings; defaulting to speakers");
-                return AudioOutput.Speakers;
+                _logger.LogError(ex, "Unable to load player settings; defaulting to speakers/sequential");
+                return (AudioOutput.Speakers, PlaybackMode.Sequential);
             }
         }
 
@@ -207,7 +223,7 @@ namespace MusicPlayer.Player
         {
             try
             {
-                await MongoDbClient.Instance.SavePlayerSettingsAsync(new PlayerSettings { AudioOutput = _activeOutput });
+                await MongoDbClient.Instance.SavePlayerSettingsAsync(new PlayerSettings { AudioOutput = _activeOutput, Mode = _activeMode });
             }
             catch (Exception ex)
             {
@@ -247,6 +263,9 @@ namespace MusicPlayer.Player
                     _playbackInformation.PlayerState.Mode = PlaybackMode.Sequential;
                     break;
             }
+
+            _activeMode = _playbackInformation.PlayerState.Mode;
+            _ = Task.Run(async () => await SavePlayerSettingsAsync());
         }
 
         public void AddToNowPlaying(string[] paths, bool canAppend, string indexPath = null)

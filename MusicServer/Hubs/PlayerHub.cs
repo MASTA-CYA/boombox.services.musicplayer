@@ -55,10 +55,13 @@ namespace MusicServer.Hubs
             await Task.CompletedTask;
         }
 
+        // Broadcasts immediately afterward for the same reason SetAudioOutputAsync does - PlaybackBroadcast's
+        // 500ms loop only runs while something is actually playing, so without this, reordering while
+        // paused/stopped would update the backend but never reach the UI until playback resumed.
         public async Task ReorderNowPlayingAsync(string[] paths)
         {
             ExecuteOnPlayerThread(() => ReorderNowPlaying(paths));
-            await Task.CompletedTask;
+            await SendPlaybackInformationAsync();
         }
 
         public async Task RemoveNowPlayingTrackAsync(string[] paths)
