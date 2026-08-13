@@ -22,7 +22,7 @@ namespace MusicPlayer.LibraryManagement
 {
     public sealed class LibraryManager
     {
-        private static readonly ILogger _logger = AppLogger.CreateLogger<LibraryManager>();
+        private static readonly Microsoft.Extensions.Logging.ILogger _logger = AppLogger.CreateLogger<LibraryManager>();
 
         private readonly List<string> _audioFileExtensions = new List<string> { ".mp3", ".wav", ".flac", ".m4a" };
         private readonly List<string> _imageFileExtensions = new List<string> { ".png", ".jpg", ".webp", ".jpeg" };
@@ -241,6 +241,7 @@ namespace MusicPlayer.LibraryManagement
             // it," so a leftover true here would make every update in a fresh run look like a completed one.
             MappingUpdate.IsComplete = false;
             MappingUpdate.Error = null;
+            MappingUpdate.RunType = MappingRunType.FullScan;
             MappingUpdate.StartedAtUtc = DateTime.UtcNow;
 
             var process = Process.GetCurrentProcess();
@@ -276,114 +277,114 @@ namespace MusicPlayer.LibraryManagement
                     _logger.LogWarning(ex, "Unable to sample resource usage");
                 }
             }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1)))
-            try
-            {
-                MappingUpdate.Message = $"Mapping target directory: {Constants.LIBRARY_DIRECTORY}";
-
-                var directories = Directory.EnumerateDirectories(Constants.LIBRARY_DIRECTORY, "*.*", SearchOption.TopDirectoryOnly);
-                ConcurrentBag<Album> albums = new ConcurrentBag<Album>();
-                MappingUpdate.DirectoryCount = directories.Count();
-
-                // Directories are processed sequentially; parallelism happens once, below, at the file level,
-                // bounded to the machine's actual logical processor count. The old code parallelized both this
-                // loop AND the file loop inside it, which oversubscribes the thread pool instead of speeding
-                // things up (two unbounded parallel levels stacked on top of each other).
-                foreach (var directory in directories)
+                try
                 {
-                    MappingUpdate.Message = $"Mapping directory: {directory}";
+                    MappingUpdate.Message = $"Mapping target directory: {Constants.LIBRARY_DIRECTORY}";
 
-                    var directoryInfo = new DirectoryInfo(directory);
-                    var directoryName = directoryInfo.Name;
-                    if (_directoryExclusions.Contains(directoryName)) continue;
+                    var directories = Directory.EnumerateDirectories(Constants.LIBRARY_DIRECTORY, "*.*", SearchOption.TopDirectoryOnly);
+                    ConcurrentBag<Album> albums = new ConcurrentBag<Album>();
+                    MappingUpdate.DirectoryCount = directories.Count();
 
-                    if (string.Equals(directoryName, "Singles"))
+                    // Directories are processed sequentially; parallelism happens once, below, at the file level,
+                    // bounded to the machine's actual logical processor count. The old code parallelized both this
+                    // loop AND the file loop inside it, which oversubscribes the thread pool instead of speeding
+                    // things up (two unbounded parallel levels stacked on top of each other).
+                    foreach (var directory in directories)
                     {
-                        var savedSinglesAlbum = databaseAlbums?.Find(dbAlbum => string.Equals(dbAlbum.Path, directory));
-                        var singlesAlbum = MapSinglesAlbum(directory, savedSinglesAlbum, cachedFavouriteTracks, directoryInfo);
-                        albums.Add(singlesAlbum);
-                        continue;
+                        MappingUpdate.Message = $"Mapping directory: {directory}";
+
+                        var directoryInfo = new DirectoryInfo(directory);
+                        var directoryName = directoryInfo.Name;
+                        if (_directoryExclusions.Contains(directoryName)) continue;
+
+                        if (string.Equals(directoryName, "Singles"))
+                        {
+                            var savedSinglesAlbum = databaseAlbums?.Find(dbAlbum => string.Equals(dbAlbum.Path, directory));
+                            var singlesAlbum = MapSinglesAlbum(directory, savedSinglesAlbum, cachedFavouriteTracks, directoryInfo);
+                            albums.Add(singlesAlbum);
+                            continue;
+                        }
+
+                        // Materialized once and reused for image lookup, the first-audio-file lookup below, and the
+                        // parallel pass — the old code enumerated the directory twice (once via .Where().ToList() for
+                        // images, once again for the Parallel.ForEach) without ever storing the result.
+                        var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories).ToList();
+                        if (!files.Any()) continue;
+
+                        var savedAlbum = databaseAlbums?.Find(dbAlbum => string.Equals(dbAlbum.Path, directory));
+
+                        var imageFiles = files.Where(file => _imageFileExtensions.Contains(Path.GetExtension(file))).ToList();
+                        var imageFile = GetHighestResolutionImage(imageFiles);
+
+                        var firstAudioFile = files.FirstOrDefault(file => _audioFileExtensions.Contains(Path.GetExtension(file).ToLower()));
+                        if (firstAudioFile == null) continue;
+
+                        // Album-level metadata is built once, deterministically, from a single designated file before
+                        // the parallel pass starts. The old code built it lazily inside the parallel loop via
+                        // "if (album == null) album = ...", which is a data race — multiple file threads could pass
+                        // that null check simultaneously and each construct a competing Album.
+                        var album = MapAlbumMetaData(new MediaInfoWrapper(firstAudioFile), firstAudioFile, savedAlbum, directoryInfo.CreationTime);
+                        ConcurrentBag<Track> tracks = new ConcurrentBag<Track>();
+
+                        Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
+                        {
+                            if (!_audioFileExtensions.Contains(Path.GetExtension(file).ToLower())) return;
+
+                            try
+                            {
+                                var mediaInfo = new MediaInfoWrapper(file);
+                                var savedtrack = savedAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
+                                // Awaited directly instead of via Task.Run(...).GetAwaiter().GetResult() — the old code
+                                // queued a second thread-pool thread just to block-wait on it, doubling the thread cost
+                                // of every Mongo lookup on top of the Parallel.ForEach worker already blocked here.
+                                var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
+                                var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
+                                tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger.LogError(ex, "Unable to map metadata for {FilePath}", file);
+                                MappingUpdate.Error = $"Unable to map metadata: {ex.Message}";
+                            }
+                        });
+
+                        if (album.Name == null || album.Artist == "Unknown") continue;
+
+                        if (!string.IsNullOrWhiteSpace(imageFile))
+                        {
+                            var imageBytes = File.ReadAllBytes(imageFile);
+                            album.Image = $"data:image/{Path.GetExtension(imageFile)};base64,{Convert.ToBase64String(imageBytes)}";
+                        }
+
+                        album.Id = savedAlbum?.Id ?? ObjectId.GenerateNewId();
+                        album.NumberOfTracks = tracks.Count;
+                        album.Duration = tracks.Sum(track => track.Duration);
+                        album.Tracks = tracks.OrderBy(track => track.TrackNumber).ToList();
+                        album.Path = directory;
+                        albums.Add(album);
+
+                        var numberOfDiscs = tracks.Max(track => track.DiscNumber);
+                        if (album.NumberOfDiscs == 0 && numberOfDiscs > 0)
+                            album.NumberOfDiscs = numberOfDiscs;
+
+                        MappingUpdate.MappedDirectories = albums.Count;
                     }
 
-                    // Materialized once and reused for image lookup, the first-audio-file lookup below, and the
-                    // parallel pass — the old code enumerated the directory twice (once via .Where().ToList() for
-                    // images, once again for the Parallel.ForEach) without ever storing the result.
-                    var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories).ToList();
-                    if (!files.Any()) continue;
-
-                    var savedAlbum = databaseAlbums?.Find(dbAlbum => string.Equals(dbAlbum.Path, directory));
-
-                    var imageFiles = files.Where(file => _imageFileExtensions.Contains(Path.GetExtension(file))).ToList();
-                    var imageFile = GetHighestResolutionImage(imageFiles);
-
-                    var firstAudioFile = files.FirstOrDefault(file => _audioFileExtensions.Contains(Path.GetExtension(file).ToLower()));
-                    if (firstAudioFile == null) continue;
-
-                    // Album-level metadata is built once, deterministically, from a single designated file before
-                    // the parallel pass starts. The old code built it lazily inside the parallel loop via
-                    // "if (album == null) album = ...", which is a data race — multiple file threads could pass
-                    // that null check simultaneously and each construct a competing Album.
-                    var album = MapAlbumMetaData(new MediaInfoWrapper(firstAudioFile), firstAudioFile, savedAlbum, directoryInfo.CreationTime);
-                    ConcurrentBag<Track> tracks = new ConcurrentBag<Track>();
-
-                    Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
-                    {
-                        if (!_audioFileExtensions.Contains(Path.GetExtension(file).ToLower())) return;
-
-                        try
-                        {
-                            var mediaInfo = new MediaInfoWrapper(file);
-                            var savedtrack = savedAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
-                            // Awaited directly instead of via Task.Run(...).GetAwaiter().GetResult() — the old code
-                            // queued a second thread-pool thread just to block-wait on it, doubling the thread cost
-                            // of every Mongo lookup on top of the Parallel.ForEach worker already blocked here.
-                            var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
-                            var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
-                            tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogError(ex, "Unable to map metadata for {FilePath}", file);
-                            MappingUpdate.Error = $"Unable to map metadata: {ex.Message}";
-                        }
-                    });
-
-                    if (album.Name == null || album.Artist == "Unknown") continue;
-
-                    if (!string.IsNullOrWhiteSpace(imageFile))
-                    {
-                        var imageBytes = File.ReadAllBytes(imageFile);
-                        album.Image = $"data:image/{Path.GetExtension(imageFile)};base64,{Convert.ToBase64String(imageBytes)}";
-                    }
-
-                    album.Id = savedAlbum?.Id ?? ObjectId.GenerateNewId();
-                    album.NumberOfTracks = tracks.Count;
-                    album.Duration = tracks.Sum(track => track.Duration);
-                    album.Tracks = tracks.OrderBy(track => track.TrackNumber).ToList();
-                    album.Path = directory;
-                    albums.Add(album);
-
-                    var numberOfDiscs = tracks.Max(track => track.DiscNumber);
-                    if (album.NumberOfDiscs == 0 && numberOfDiscs > 0)
-                        album.NumberOfDiscs = numberOfDiscs;
-
-                    MappingUpdate.MappedDirectories = albums.Count;
+                    MappingUpdate.IsComplete = true;
+                    return albums;
                 }
-
-                MappingUpdate.IsComplete = true;
-                return albums;
-            }
-            catch (UnauthorizedAccessException ex)
-            {
-                _logger.LogError(ex, "Access denied while mapping library");
-                MappingUpdate.Error = $"Access denied: {ex.Message}";
-                throw;
-            }
-            catch (DirectoryNotFoundException ex)
-            {
-                _logger.LogError(ex, "Directory not found while mapping library");
-                MappingUpdate.Error = $"Directory not found: {ex.Message}";
-                throw;
-            }
+                catch (UnauthorizedAccessException ex)
+                {
+                    _logger.LogError(ex, "Access denied while mapping library");
+                    MappingUpdate.Error = $"Access denied: {ex.Message}";
+                    throw;
+                }
+                catch (DirectoryNotFoundException ex)
+                {
+                    _logger.LogError(ex, "Directory not found while mapping library");
+                    MappingUpdate.Error = $"Directory not found: {ex.Message}";
+                    throw;
+                }
         }
 
         private Album MapSinglesAlbum(string directory, Album savedAlbum, List<PlaylistTrack> cachedFavouriteTracks, DirectoryInfo directoryInfo)

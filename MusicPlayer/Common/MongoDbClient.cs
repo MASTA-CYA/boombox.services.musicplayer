@@ -19,6 +19,7 @@ namespace MusicPlayer.Common
         private readonly IMongoCollection<Playlist> _playlistCollection;
         private readonly IMongoCollection<EqualizerPreset> _equalizerCollection;
         private readonly IMongoCollection<MappingStatistic> _mappingStatisticCollection;
+        private readonly IMongoCollection<PlayerSettings> _playerSettingsCollection;
 
         #region Singleton
         private static readonly Lazy<MongoDbClient> _instance = new Lazy<MongoDbClient>(() => new MongoDbClient());
@@ -32,6 +33,7 @@ namespace MusicPlayer.Common
             _playlistCollection = _database.GetCollection<Playlist>("playlists");
             _equalizerCollection = _database.GetCollection<EqualizerPreset>("equalizer");
             _mappingStatisticCollection = _database.GetCollection<MappingStatistic>("mapping_statistics");
+            _playerSettingsCollection = _database.GetCollection<PlayerSettings>("player_settings");
 
             // GetCollection<T>() above never touches the server — it's just a client-side handle. MongoDB only
             // creates a collection on its first write, so without this, a fresh database would be missing whichever
@@ -48,7 +50,7 @@ namespace MusicPlayer.Common
         private async Task EnsureCollectionsExistAsync()
         {
             var existingCollectionNames = new HashSet<string>(await (await _database.ListCollectionNamesAsync()).ToListAsync());
-            var expectedCollectionNames = new[] { "albums", "playlists", "equalizer", "mapping_statistics" };
+            var expectedCollectionNames = new[] { "albums", "playlists", "equalizer", "mapping_statistics", "player_settings" };
 
             foreach (var collectionName in expectedCollectionNames)
             {
@@ -189,5 +191,15 @@ namespace MusicPlayer.Common
         public async Task<MappingStatistic> GetMappingStatisticAsync(ObjectId id) => await _mappingStatisticCollection.Find(statistic => statistic.Id.Equals(id)).FirstOrDefaultAsync();
 
         #endregion Mapping Statistics
+
+        #region Player Settings
+        public async Task<PlayerSettings> GetPlayerSettingsAsync() => await _playerSettingsCollection.Find(Builders<PlayerSettings>.Filter.Empty).FirstOrDefaultAsync();
+
+        // There's only ever meant to be one document in this collection, so an empty filter with IsUpsert is
+        // enough - it replaces the single existing row, or inserts one if this is the very first save.
+        public async Task SavePlayerSettingsAsync(PlayerSettings settings)
+            => await _playerSettingsCollection.ReplaceOneAsync(Builders<PlayerSettings>.Filter.Empty, settings, new ReplaceOptions { IsUpsert = true });
+
+        #endregion Player Settings
     }
 }

@@ -85,6 +85,16 @@ namespace MusicServer.Hubs
             await Task.CompletedTask;
         }
 
+        // Runs on the same STA player thread as every other action here - both AsioOut and WasapiOut are
+        // COM-based. Broadcasts the updated PlaybackInformation immediately afterward rather than waiting for
+        // PlaybackBroadcast's 500ms loop, since that loop only runs while something is actually playing - without
+        // this, switching output while paused/stopped would silently update the backend but never reach the UI.
+        public async Task SetAudioOutputAsync(AudioOutput output)
+        {
+            ExecuteOnPlayerThread(() => SetAudioOutput(output));
+            await SendPlaybackInformationAsync();
+        }
+
         #endregion Public Methods
 
         #region Private Methods
@@ -141,6 +151,7 @@ namespace MusicServer.Hubs
         private static void ReorderNowPlaying(string[] paths) => Player.Instance.ReorderNowPlayingPlaylist(paths);
         private static void RemoveNowPlayingTrack(string[] paths) => Player.Instance.RemoveNowPlayingTrack(paths);
         private static void ApplyEqualizerPreset(EqualizerPreset preset) => Player.Instance.ApplyEqualizerPreset(preset);
+        private static void SetAudioOutput(AudioOutput output) => Player.Instance.SetAudioOutput(output);
 
         #endregion Private Methods
     }

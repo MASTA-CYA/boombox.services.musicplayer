@@ -50,6 +50,7 @@ namespace MusicServer.Startup
         private static async Task RunAsync(CancellationToken token)
         {
             using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(2000));
+
             try
             {
                 while (await timer.WaitForNextTickAsync(token))
@@ -58,13 +59,18 @@ namespace MusicServer.Startup
 
                     try
                     {
+                        // Used to also merge in a "Playlists" Redis key here, but nothing in the app ever wrote
+                        // that key - RedisCache.GetAsync("Playlists") was throwing "key does not exist" on every
+                        // single tick forever, not reporting a real outage, so it just warned (and toasted a
+                        // snackbar via SignalRErrorSink) every 2 seconds for no reason. Removed rather than merely
+                        // silenced: caching the full playlist JSON in Redis would be a meaningful amount of data to
+                        // push through it on every read anyway, so Mongo-only is the right shape here, not just a
+                        // fallback.
                         playlists = await PlaylistManager.Instance.GetPlaylistsAsync();
-                        var playlistsResponse = await RedisCache.GetAsync("Playlists");
-                        playlists.AddRange(JsonSerializer.Deserialize<List<Playlist>>(playlistsResponse) ?? []);
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "Unable to merge Redis playlist cache, falling back to Mongo-only playlists");
+                        _logger.LogWarning(ex, "Unable to load playlists");
                     }
                     finally
                     {

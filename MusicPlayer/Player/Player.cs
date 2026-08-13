@@ -6,6 +6,7 @@ using MusicPlayer.LibraryManagement;
 using MusicPlayer.LibraryManagement.Models;
 using MusicPlayer.Player.Models;
 using MusicPlayer.PlaylistManagement.Models;
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
@@ -21,10 +22,18 @@ namespace MusicPlayer.Player
     {
         private const string ASIO_DRIVER = "Focusrite USB ASIO";
 
+        // The Corsair HS80 has no ASIO driver of its own (USB gaming headsets never do - only pro audio
+        // interfaces like the Focusrite ship one), so it's reached via WasapiOut instead, matched against the
+        // Windows device name. A substring match on "HS80" rather than the full "Speakers (CORSAIR HS80 RGB USB
+        // Gaming Headset)" string is deliberately loose - resilient to Windows renaming/reordering the exact
+        // "Speakers (...)" prefix, while still specific enough not to collide with anything else plugged in.
+        private const string HEADSET_DEVICE_NAME_SUBSTRING = "HS80";
+
         private static readonly ILogger _logger = AppLogger.CreateLogger<Player>();
 
         private readonly string _activeDriver;
-        private AsioOut _audioPlayer;
+        private AudioOutput _activeOutput;
+        private IWavePlayer _audioPlayer;
         private DynamicPlaylistSampleProvider _playlistProvider;
         private List<PlaylistTrack> _queuedPlaylist;
         private float[] _bandCenterFrequencies;
@@ -65,6 +74,9 @@ namespace MusicPlayer.Player
                 _logger.LogWarning("Configured ASIO driver \"{ConfiguredDriver}\" not found; falling back to {FallbackDriver}", ASIO_DRIVER, _activeDriver ?? "(none available)");
             }
 
+            _activeOutput = LoadPlayerSettingsAsync().GetAwaiter().GetResult();
+            _logger.LogInformation("Starting with audio output {AudioOutput}", _activeOutput);
+
             PrepareEqualizerPresets();
         }
 
@@ -101,7 +113,7 @@ namespace MusicPlayer.Player
                 _audioPlayer = null;
             }
 
-            _audioPlayer = new AsioOut(_activeDriver);
+            _audioPlayer = CreateAudioPlayer();
             _audioPlayer.Init(_playlistProvider);
             _audioPlayer.Play();
         }
@@ -109,6 +121,99 @@ namespace MusicPlayer.Player
         public void Pause() => _audioPlayer.Pause();
 
         public void Resume() => _audioPlayer.Play();
+
+        // Called from PlayerHub on the same STA thread every other player action runs on - both AsioOut and
+        // WasapiOut are COM-based underneath and expect it. Deliberately doesn't rebuild _playlistProvider the way
+        // Play() does: NAudio sample providers track their own read position internally, so reusing the same
+        // instance and only swapping the IWavePlayer underneath it means switching speakers <-> headset mid-track
+        // resumes from exactly where it was instead of restarting the current track.
+        public void SetAudioOutput(AudioOutput output)
+        {
+            if (_activeOutput == output) return;
+
+            lock (_locker)
+            {
+                _activeOutput = output;
+
+                if (_audioPlayer != null && _playlistProvider != null)
+                {
+                    var wasPlaying = _audioPlayer.PlaybackState == PlaybackState.Playing;
+
+                    _audioPlayer.Stop();
+                    _audioPlayer.Dispose();
+                    _audioPlayer = CreateAudioPlayer();
+                    _audioPlayer.Init(_playlistProvider);
+
+                    if (wasPlaying) _audioPlayer.Play();
+                }
+
+                // PlaybackInformation's getter kicks off UpdatePlaybackInformation on a background thread and
+                // returns immediately (see GetPlaybackInformation) - PlayerHub.SetAudioOutputAsync broadcasts right
+                // after this call returns specifically so a switch while paused/stopped still reaches the UI (the
+                // 500ms PlaybackBroadcast loop only runs while something is playing), so PlayerState.AudioOutput
+                // needs to already be correct by then rather than depending on that background refresh's timing.
+                if (_playbackInformation != null)
+                    _playbackInformation.PlayerState.AudioOutput = _activeOutput;
+            }
+
+            _ = Task.Run(async () => await SavePlayerSettingsAsync());
+        }
+
+        // Speakers go through the same ASIO driver Play() has always used. Headset has no ASIO driver, so it goes
+        // through WasapiOut targeting whichever active render-endpoint's name contains "HS80". If that device
+        // isn't found (headset unplugged, Windows renamed it, etc.), falls back to speakers with a warning rather
+        // than throwing - same fallback philosophy as the ASIO driver selection in the constructor.
+        private IWavePlayer CreateAudioPlayer()
+        {
+            if (_activeOutput == AudioOutput.Headset)
+            {
+                // Classic using(){} block rather than a C# 8 using declaration - MusicPlayer targets C# 7.3 (see
+                // the same note on library mapping's Parallel.ForEachAsync avoidance), which doesn't support it.
+                MMDevice headsetDevice;
+                using (var enumerator = new MMDeviceEnumerator())
+                {
+                    headsetDevice = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
+                        .FirstOrDefault(device => device.FriendlyName?.IndexOf(HEADSET_DEVICE_NAME_SUBSTRING, StringComparison.OrdinalIgnoreCase) >= 0);
+                }
+
+                if (headsetDevice != null)
+                {
+                    _logger.LogInformation("Using WASAPI headset device {DeviceName}", headsetDevice.FriendlyName);
+                    return new WasapiOut(headsetDevice, AudioClientShareMode.Shared, true, 200);
+                }
+
+                _logger.LogWarning("No active audio device matching \"{Substring}\" found; falling back to speakers", HEADSET_DEVICE_NAME_SUBSTRING);
+                _activeOutput = AudioOutput.Speakers;
+            }
+
+            return new AsioOut(_activeDriver);
+        }
+
+        private async Task<AudioOutput> LoadPlayerSettingsAsync()
+        {
+            try
+            {
+                var settings = await MongoDbClient.Instance.GetPlayerSettingsAsync();
+                return settings?.AudioOutput ?? AudioOutput.Speakers;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unable to load player settings; defaulting to speakers");
+                return AudioOutput.Speakers;
+            }
+        }
+
+        private async Task SavePlayerSettingsAsync()
+        {
+            try
+            {
+                await MongoDbClient.Instance.SavePlayerSettingsAsync(new PlayerSettings { AudioOutput = _activeOutput });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unable to save player settings");
+            }
+        }
 
         public void PlayNext()
         {
@@ -207,6 +312,7 @@ namespace MusicPlayer.Player
                     _playbackInformation.PlayerState.IsPlaying = _audioPlayer?.PlaybackState == PlaybackState.Playing;
                     _playbackInformation.PlayerState.HasPrevious = _playlistProvider?.HasPreviousProvider ?? false;
                     _playbackInformation.PlayerState.HasNext = (_playlistProvider?.HasNextProvider) ?? false;
+                    _playbackInformation.PlayerState.AudioOutput = _activeOutput;
                     _playbackInformation.Tracks = _queuedPlaylist;
                 }
                 catch (Exception ex)

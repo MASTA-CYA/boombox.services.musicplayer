@@ -225,6 +225,8 @@
     <Compile Include="LibraryManagement\LibraryManager.cs" />
     <Compile Include="LibraryManagement\Models\Album.cs" />
     <Compile Include="LibraryManagement\Models\FavouriteTrackEventArgs.cs" />
+    <Compile Include="LibraryManagement\Models\MappingRunType.cs" />
+    <Compile Include="LibraryManagement\Models\MappingStatistic.cs" />
     <Compile Include="LibraryManagement\Models\MappingUpdate.cs" />
     <Compile Include="AutoScrollManagement\Models\ScrollPosition.cs" />
     <Compile Include="LibraryManagement\Models\Track.cs" />
@@ -241,6 +243,8 @@
     <Compile Include="Player\Models\PlaybackInformation.cs" />
     <Compile Include="Player\Models\PlaybackMode.cs" />
     <Compile Include="Player\Models\PlayerState.cs" />
+    <Compile Include="Player\Models\AudioOutput.cs" />
+    <Compile Include="Player\Models\PlayerSettings.cs" />
     <Compile Include="PlaylistManagement\Models\PlaylistTrack.cs" />
     <Compile Include="Common\PeekingEnumerator.cs" />
     <Compile Include="Player\Player.cs" />

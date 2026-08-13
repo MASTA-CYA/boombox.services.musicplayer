@@ -16,6 +16,7 @@ namespace MusicPlayer.LibraryManagement.Models
         private DateTime? _startedAtUtc;
         private double _cpuPercent;
         private double _memoryMb;
+        private MappingRunType _runType;
 
         public event EventHandler Changed;
 
@@ -26,6 +27,17 @@ namespace MusicPlayer.LibraryManagement.Models
         {
             get => _startedAtUtc;
             set { _startedAtUtc = value; OnChanged(); }
+        }
+
+        // Set alongside StartedAtUtc at the start of every run - FullScan by LibraryManager.GetAlbums (walks disk,
+        // re-reads file metadata), Cache by LibraryHub.GetLibraryResponseFromFileAsync (just loads the already-
+        // mapped albums back out of the local JSON cache, the common case on a normal startup). Lets both the live
+        // progress screen and the persisted MappingStatistic history distinguish the two instead of a cache load
+        // looking identical to - or, before this, simply not showing - a full rescan.
+        public MappingRunType RunType
+        {
+            get => _runType;
+            set { _runType = value; OnChanged(); }
         }
 
         // Process-level (not system-wide) CPU/memory, sampled roughly once a second while a rescan is running —

@@ -44,14 +44,16 @@ namespace MusicServer.Startup
                 try
                 {
                     var update = (MappingUpdate)sender;
-                    string mappingUpdateJson;
+                    string broadcastJson;
                     MappingStatistic statisticToPersist = null;
 
                     lock (historyLock)
                     {
                         // A different StartedAtUtc means a new run began since the last event — reset this run's
                         // accumulators. Never write back onto `update` itself here: MappingUpdate.Changed handlers
-                        // mutating the very instance that raised them would re-trigger Changed recursively.
+                        // mutating the very instance that raised them would re-trigger Changed recursively. That's
+                        // also why the live BytesBroadcast figure below is merged into a separate anonymous object
+                        // for broadcasting rather than ever being assigned onto `update`.
                         if (update.StartedAtUtc != currentRunStartedAt)
                         {
                             currentRunStartedAt = update.StartedAtUtc;
@@ -60,8 +62,27 @@ namespace MusicServer.Startup
                             lastSampleAt = null;
                         }
 
-                        mappingUpdateJson = JsonConvert.SerializeObject(update, JsonSerializationHelper.NamingSerializerSettings);
-                        bytesBroadcastThisRun += Encoding.UTF8.GetByteCount(mappingUpdateJson);
+                        // Byte-accounting is based on the update alone (not the merged payload below) so the
+                        // persisted MappingStatistic.BytesBroadcast total stays consistent run over run regardless
+                        // of what extra fields the live broadcast payload happens to carry.
+                        var updateOnlyJson = JsonConvert.SerializeObject(update, JsonSerializationHelper.NamingSerializerSettings);
+                        bytesBroadcastThisRun += Encoding.UTF8.GetByteCount(updateOnlyJson);
+
+                        var broadcastPayload = new
+                        {
+                            update.StartedAtUtc,
+                            update.CpuPercent,
+                            update.MemoryMb,
+                            update.DirectoryCount,
+                            update.MappedDirectories,
+                            update.Percent,
+                            update.Message,
+                            update.Error,
+                            update.IsComplete,
+                            update.RunType,
+                            BytesBroadcast = bytesBroadcastThisRun
+                        };
+                        broadcastJson = JsonConvert.SerializeObject(broadcastPayload, JsonSerializationHelper.NamingSerializerSettings);
 
                         var now = DateTime.UtcNow;
 
@@ -79,6 +100,7 @@ namespace MusicServer.Startup
                         {
                             statisticToPersist = new MappingStatistic
                             {
+                                RunType = update.RunType,
                                 StartedAtUtc = update.StartedAtUtc.Value,
                                 CompletedAtUtc = now,
                                 DurationMs = (now - update.StartedAtUtc.Value).TotalMilliseconds,
@@ -91,7 +113,7 @@ namespace MusicServer.Startup
                         }
                     }
 
-                    await libraryHubContext.Clients.All.SendAsync("ReceiveMappingUpdate", mappingUpdateJson);
+                    await libraryHubContext.Clients.All.SendAsync("ReceiveMappingUpdate", broadcastJson);
 
                     if (statisticToPersist != null)
                         await MongoDbClient.Instance.InsertMappingStatisticAsync(statisticToPersist);

@@ -1,5 +1,6 @@
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 
@@ -14,7 +15,11 @@ namespace MusicPlayer.LibraryManagement.Models
     // for this new collection specifically, not a retrofit of the older models.
     public sealed class MappingStatistic
     {
-        [BsonId] public ObjectId Id { get; set; }
+        // Without this converter, Newtonsoft serializes ObjectId as a nested object (Timestamp/Machine/Pid/...)
+        // instead of a plain string, breaking the Angular `id: string` field on the Settings > Mapping Statistics
+        // tab. Album.Id uses the same converter for the same reason - see ObjectIdConverter.cs.
+        [BsonId][JsonConverter(typeof(ObjectIdConverter))] public ObjectId Id { get; set; }
+        [BsonElement("run_type")] public MappingRunType RunType { get; set; }
         [BsonElement("started_at")] public DateTime StartedAtUtc { get; set; }
         [BsonElement("completed_at")] public DateTime CompletedAtUtc { get; set; }
         [BsonElement("duration_ms")] public double DurationMs { get; set; }
