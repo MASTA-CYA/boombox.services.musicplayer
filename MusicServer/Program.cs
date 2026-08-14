@@ -93,6 +93,7 @@ namespace MusicServer
                 PlaylistBroadcast.Initialize(app);
                 ServerStatusBroadcast.Initialize(app);
                 TrackUserDataBroadcast.Initialize(app);
+                AudioOutputAvailabilityBroadcast.Initialize(app);
 
                 // Configure the HTTP request pipeline.
                 if (app.Environment.IsDevelopment())

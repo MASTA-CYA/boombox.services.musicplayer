@@ -533,7 +533,10 @@ namespace MusicPlayer.Player
             // IsPlaying/HasNext/Tracks/etc. permanently once the playlist ended, the same "frozen playback info"
             // failure mode as the earlier delete-track bug. Nothing to rewind to with no current provider, so
             // false is the correct/safe result here, not a crash.
-            if (_currentProvider is not EnhancedAudioFileReader currentProvider) return false;
+            // ('is not' pattern matching needs C# 9 - MusicPlayer targets C# 7.3, hence the `as` + null check
+            // instead, same style as every other cast in this file.)
+            var currentProvider = _currentProvider as EnhancedAudioFileReader;
+            if (currentProvider == null) return false;
 
             var currentTime = currentProvider.CurrentTime.TotalSeconds;
             return currentTime > 10;

@@ -17,6 +17,14 @@ namespace MusicServer.Hubs
         public async Task InitializePlayerAsync()
         {
             ExecuteOnPlayerThread(InitializePlayer);
+
+            // Same "start once per connection, run for its lifetime regardless of playback state" pattern as
+            // ServerHub.StartServerStatusUpdatedAsync/ServerStatusBroadcast - the frontend calls
+            // InitializePlayerAsync once, unconditionally, as part of its own startup sequence
+            // (PlayerService.startConnectionAsync), so this is the natural place to kick availability
+            // monitoring off without needing a new hub method the frontend would have to remember to call.
+            AudioOutputAvailabilityBroadcast.Start();
+
             await Task.CompletedTask;
         }
 
@@ -153,20 +161,13 @@ namespace MusicServer.Hubs
             await Clients.All.SendAsync("ReceivePlaybackInformation", playbackInfoJson);
         }
 
+        // Delegates to the shared PlayerThreadExecutor (MusicServer/Helpers) rather than spinning up its own
+        // STA thread inline - AudioOutputAvailabilityBroadcast needs the exact same STA guarantee for a
+        // server-initiated output switch, so the actual thread-marshalling logic now lives in one place.
         [SupportedOSPlatform("windows")]
         private void ExecuteOnPlayerThread(Action action)
-        {
-            var thread = new Thread(() => ErrorHandlingAction(action));
-            thread.SetApartmentState(ApartmentState.STA);
-            thread.Start();
-            thread.Join();
-        }
+            => PlayerThreadExecutor.Execute(action, ex => Task.Run(async () => await Clients.All.SendAsync("ReceivePlayerHubError", ex.Message)));
 
-        private void ErrorHandlingAction(Action action)
-        {
-            try { action.Invoke(); }
-            catch (Exception ex) { Task.Run(async () => await Clients.All.SendAsync("ReceivePlayerHubError", ex.Message)); }
-        }
         private async Task ErrorHandlingActionAsync(Func<Task> action)
         {
             try { await action.Invoke(); }

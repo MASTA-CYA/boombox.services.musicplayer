@@ -218,6 +218,44 @@ namespace MusicPlayer.Player
 
         private static bool IsHeadsetDeviceAvailable() => FindHeadsetDevice() != null;
 
+        // AsioOut.GetDriverNames() is just a registry lookup - unlike constructing an AsioOut instance, it
+        // never opens the driver, so (like FindHeadsetDevice's WASAPI enumeration) it's safe to poll
+        // repeatedly from a background thread without conflicting with an already-open AsioOut during live
+        // playback.
+        private static bool IsSpeakersDeviceAvailable()
+            => AsioOut.GetDriverNames().Any(driver => string.Equals(driver, ASIO_DRIVER, StringComparison.OrdinalIgnoreCase));
+
+        // Polled every couple of seconds by MusicServer's AudioOutputAvailabilityBroadcast, independent of
+        // playback state (a USB device can disappear whether or not anything is playing - PlaybackBroadcast's
+        // 500ms loop only runs while something is). Updates PlayerState so the sidebar can grey out whichever
+        // output isn't currently reachable, and - if the output actually in use just became the unavailable
+        // one while the other is available - reports which output the caller needs to force-switch to.
+        // Deliberately doesn't perform that switch itself: SetAudioOutput touches AsioOut/WasapiOut (COM) and
+        // must run on a dedicated STA thread, which this method (called from an arbitrary background thread)
+        // isn't guaranteed to be - the caller is responsible for marshalling that call appropriately (see
+        // PlayerThreadExecutor) and for broadcasting the refreshed PlaybackInformation afterward.
+        public (bool IsSpeakersAvailable, bool IsHeadsetAvailable, AudioOutput? RequiredFallback) RefreshOutputAvailability()
+        {
+            var isSpeakersAvailable = IsSpeakersDeviceAvailable();
+            var isHeadsetAvailable = IsHeadsetDeviceAvailable();
+            AudioOutput? requiredFallback = null;
+
+            lock (_locker)
+            {
+                if (!_isInitialized) InitializePlayer();
+
+                _playbackInformation.PlayerState.IsSpeakersAvailable = isSpeakersAvailable;
+                _playbackInformation.PlayerState.IsHeadsetAvailable = isHeadsetAvailable;
+
+                if (_activeOutput == AudioOutput.Speakers && !isSpeakersAvailable && isHeadsetAvailable)
+                    requiredFallback = AudioOutput.Headset;
+                else if (_activeOutput == AudioOutput.Headset && !isHeadsetAvailable && isSpeakersAvailable)
+                    requiredFallback = AudioOutput.Speakers;
+            }
+
+            return (isSpeakersAvailable, isHeadsetAvailable, requiredFallback);
+        }
+
         // _playbackInformation gets replaced wholesale (`new PlaybackInformation()`) in both InitializePlayer()
         // and Play(), which resets PlayerState back to its class defaults (Speakers/Sequential) regardless of
         // what's actually persisted/active. Previously the only thing that corrected this was
