@@ -37,7 +37,14 @@ namespace MusicPlayer.Player
 
         public ISampleProvider CurrentProvider { get => _currentProvider; }
         public bool HasPreviousProvider { get => HasPreviuosProvider(); }
-        public bool HasNextProvider { get => _enumerator.HasNext || _queuedProviders.Any(); }
+        // Was `_enumerator.HasNext || _queuedProviders.Any()` - _enumerator wraps the raw, not-yet-purged
+        // _providers, so a track that had just been deleted (removal is deferred to AddQueuedProviders at the
+        // next track change, same as reorder) still counted as "next" here until that purge actually ran. That
+        // let the UI's Next button stay enabled after deleting the only remaining upcoming track, so clicking
+        // it triggered a real "reached end of playlist" instead of just doing nothing / greying out. Basing
+        // this on GetProviders() (which already accounts for both pending removals and pending adds) instead of
+        // the raw enumerator makes it correct immediately, without waiting for the deferred purge.
+        public bool HasNextProvider { get => HasEffectiveNextProvider(); }
         public WaveFormat WaveFormat { get; }
 
         public event EventHandler<CurrentProviderEventArgs> ReachedEndOfProvider;
@@ -375,50 +382,61 @@ namespace MusicPlayer.Player
             HandleSequentialPlayback();
         }
 
+        // Add/remove/reorder are three independent deferred operations, all deliberately held back from
+        // touching _providers/_enumerator until here (track-end, via HandleEndOfProviderReached) rather than
+        // applied immediately - this runs off the audio callback thread mid-Read(), and mutating the
+        // enumerator's source while it's being read from is unsafe.
+        //
+        // Previously the removal branch only ran when _queuedProviders had a pending add queued too - a plain
+        // delete with nothing queued to add left _removedProviders populated but never actually applied to
+        // _providers. Providers.Count() then permanently disagreed with the display list's count, which tripped
+        // Player.UpdatePlaybackInformation()'s guard forever (not just until the next track change) - freezing
+        // every playback field (IsPlaying, HasNext, PlayedDuration, etc.) the moment a track was deleted. Each
+        // branch below now runs independently, so a plain removal is applied on its own.
         private void AddQueuedProviders()
         {
-            if (!_queuedProviders.Any())
-            {
-                if (_proposedOrder.Any())
-                {
-                    var orderedProviders = _providers.OrderBy(provider => _proposedOrder.IndexOf((provider as EnhancedAudioFileReader).OriginalFilePath)).AsEnumerable();
-                    _providers = orderedProviders.AsEnumerable();
-                    ResetEnumerator();
-                    _proposedOrder.Clear();
-                }
-                return;
-            }
+            var hasRemovals = _removedProviders.Any();
+            var hasQueuedAdds = _queuedProviders.Any();
+            var hasReorder = _proposedOrder.Any();
+
+            if (!hasRemovals && !hasQueuedAdds && !hasReorder) return;
 
             var providers = _providers.ToList();
-            providers.RemoveAll(provider => _removedProviders.Contains((provider as EnhancedAudioFileReader).OriginalFilePath));
-            _removedProviders.Clear();
 
-            foreach (var queuedProvider in _queuedProviders)
+            if (hasRemovals)
             {
-                var index = providers.FindIndex(provider => string.Equals((provider as EnhancedAudioFileReader).OriginalFilePath, queuedProvider.IndexPath));
-
-                if (queuedProvider.CanAppend)
-                    providers.AddRange(index, queuedProvider.Providers);
-                else
-                    providers.InsertRange(index, queuedProvider.Providers);
+                providers.RemoveAll(provider => _removedProviders.Contains((provider as EnhancedAudioFileReader).OriginalFilePath));
+                _removedProviders.Clear();
             }
 
-            if (_proposedOrder.Any())
+            if (hasQueuedAdds)
             {
-                _providers = providers.OrderBy(provider => _proposedOrder.IndexOf((provider as EnhancedAudioFileReader).OriginalFilePath)).AsEnumerable();
+                foreach (var queuedProvider in _queuedProviders)
+                {
+                    var index = ResolveAnchorIndex(providers, queuedProvider.IndexPath);
+
+                    if (queuedProvider.CanAppend)
+                        providers.AddRange(index, queuedProvider.Providers);
+                    else
+                        providers.InsertRange(index, queuedProvider.Providers);
+                }
+
+                var queue = _queuedProviders.ToList();
+                queue.Clear();
+                _queuedProviders = queue;
+            }
+
+            if (hasReorder)
+            {
+                providers = providers.OrderBy(provider => _proposedOrder.IndexOf((provider as EnhancedAudioFileReader).OriginalFilePath)).ToList();
                 _proposedOrder.Clear();
             }
-            else
-            {
-                _providers = providers.AsEnumerable();
-            }
 
-            var queue = _queuedProviders.ToList();
-            queue.Clear();
-            _queuedProviders = queue;
+            _providers = providers.AsEnumerable();
             ResetEnumerator();
 
-            QueuedProvidersAdded.Invoke(this, EventArgs.Empty);
+            if (hasQueuedAdds)
+                QueuedProvidersAdded.Invoke(this, EventArgs.Empty);
         }
 
         public void ReOrderProviders(string[] paths) => _proposedOrder = paths.ToList();
@@ -431,15 +449,14 @@ namespace MusicPlayer.Player
             foreach (var queuedProvider in queuedProviders)
             {
                 var providers = queuedProvider.Providers.ToList();
-                var toBeRemoved = providers.FindAll(provider => paths.Contains((provider as EnhancedAudioFileReader).OriginalFilePath));
 
-                if (toBeRemoved == null)
-                {
-                    newQueuedProviders.Add(queuedProvider);
-                    continue;
-                }
-
-                providers.RemoveAll(provider => string.Equals(toBeRemoved.Select(remove => (remove as EnhancedAudioFileReader).OriginalFilePath), (provider as EnhancedAudioFileReader).OriginalFilePath));
+                // Was `string.Equals(toBeRemoved.Select(...), (provider...))` - comparing an IEnumerable<string>
+                // to a single string via the static object overload, which is always false. So a track that had
+                // been queued to add but not yet merged into _providers could never actually be pulled back out
+                // of that pending queue via this path (harmless on its own - AddQueuedProviders' removal branch
+                // below still purges it from _providers once merged - but meant deleting a track before it ever
+                // played would leave a dead/duplicate entry queued to be added anyway).
+                providers.RemoveAll(provider => paths.Contains((provider as EnhancedAudioFileReader).OriginalFilePath));
                 queuedProvider.Providers = providers;
                 newQueuedProviders.Add(queuedProvider);
             }
@@ -455,14 +472,22 @@ namespace MusicPlayer.Player
             _enumerator.MoveToElement(currentProvider);
         }
 
+        // The "logical" current queue - _providers with any pending removal already subtracted and any
+        // pending add already merged in, even though neither has actually been applied to _providers itself
+        // yet (deferred until AddQueuedProviders runs at the next track change - see the note on that method).
+        // Previously this only accounted for pending adds, not removals, which is what let a just-deleted
+        // track keep counting toward Providers.Count()/HasNextProvider until the deferred purge caught up.
         private IEnumerable<ISampleProvider> GetProviders()
         {
-            if (!_queuedProviders?.Any() ?? true) return _providers;
+            var providers = _removedProviders.Any()
+                ? _providers.Where(provider => !_removedProviders.Contains((provider as EnhancedAudioFileReader).OriginalFilePath)).ToList()
+                : _providers.ToList();
 
-            var providers = _providers.ToList();
+            if (!_queuedProviders?.Any() ?? true) return providers;
+
             foreach (var queuedProvider in _queuedProviders)
             {
-                var index = providers.FindIndex(provider => string.Equals((provider as EnhancedAudioFileReader).OriginalFilePath, queuedProvider.IndexPath));
+                var index = ResolveAnchorIndex(providers, queuedProvider.IndexPath);
 
                 if (queuedProvider.CanAppend)
                     providers.AddRange(index, queuedProvider.Providers);
@@ -473,14 +498,45 @@ namespace MusicPlayer.Player
             return providers;
         }
 
+        // A queued add is anchored to whatever track was "current" (IndexPath) at the moment it was queued -
+        // but that anchor can be deleted before the add is ever merged in (here, or in AddQueuedProviders).
+        // FindIndex then returns -1, and passing that straight to ListExtensions.AddRange/List<T>.InsertRange
+        // throws ArgumentOutOfRangeException - that's the crash this fixes. Falling back to the end of the list
+        // is a reasonable default: the add still lands in the playlist, just at the tail instead of wherever
+        // its now-gone anchor used to be.
+        private static int ResolveAnchorIndex(List<ISampleProvider> providers, string indexPath)
+        {
+            var index = providers.FindIndex(provider => string.Equals((provider as EnhancedAudioFileReader).OriginalFilePath, indexPath));
+            return index == -1 ? providers.Count : index;
+        }
+
+        private bool HasEffectiveNextProvider()
+        {
+            var effectiveProviders = GetProviders().ToList();
+            var currentIndex = effectiveProviders.FindIndex(provider => provider.Equals(_currentProvider));
+
+            // currentIndex is -1 if _currentProvider itself was just removed (deleting the currently-playing
+            // track) - that's a separate, not-yet-handled edge case; falling back to "no next" here is the safe
+            // default rather than guessing.
+            return currentIndex >= 0 && currentIndex < effectiveProviders.Count - 1;
+        }
+
         private bool HasPreviuosProvider()
         {
             if (_enumerator.HasPrevious) return true;
 
-            var currentTime = (_currentProvider as EnhancedAudioFileReader).CurrentTime.TotalSeconds;
-            if (currentTime > 10) return true;
+            // _currentProvider is null once playback has reached the natural end of the playlist (see
+            // HandleSequentialPlayback, which sets it to null when !_enumerator.HasNext) - the unguarded cast
+            // below then threw a NullReferenceException on every UpdatePlaybackInformation() poll tick from
+            // that point on. That call is wrapped in a try/catch that only logs, so the exception itself didn't
+            // crash anything, but it aborted the rest of UpdatePlaybackInformation() every time - freezing
+            // IsPlaying/HasNext/Tracks/etc. permanently once the playlist ended, the same "frozen playback info"
+            // failure mode as the earlier delete-track bug. Nothing to rewind to with no current provider, so
+            // false is the correct/safe result here, not a crash.
+            if (_currentProvider is not EnhancedAudioFileReader currentProvider) return false;
 
-            return false;
+            var currentTime = currentProvider.CurrentTime.TotalSeconds;
+            return currentTime > 10;
         }
 
         #region Dispose Pattern

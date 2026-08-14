@@ -82,6 +82,8 @@ namespace MusicPlayer.Common
             await _equalizerCollection.ReplaceOneAsync(filter, preset);
         }
 
+        public async Task DeleteEqualizerPresetAsync(Guid guid) => await _equalizerCollection.DeleteOneAsync(preset => preset.Guid == guid);
+
         #endregion Equalizer
 
         #region Album

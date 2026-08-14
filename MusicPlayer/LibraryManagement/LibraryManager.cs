@@ -5,6 +5,7 @@ using MusicPlayer.Common;
 using MusicPlayer.FileManagement;
 using MusicPlayer.Helpers;
 using MusicPlayer.LibraryManagement.Models;
+using MusicPlayer.Player.Models;
 using MusicPlayer.PlaylistManagement.Models;
 using NAudio.Wave;
 using Newtonsoft.Json;
@@ -229,6 +230,101 @@ namespace MusicPlayer.LibraryManagement
             _ = Task.Run(async () => await UpsertMappedAlbumsAsync(new ConcurrentBag<Album> { mappedAlbum }));
             _ = Task.Run(() => FileManager.Instance.Write(mappedAlbum));
         }
+
+        #region Equalizer Assignments
+
+        // Feeds Settings' "Equalizer" tab track-assignment list. Deliberately doesn't go through the full
+        // GetAlbumsAsync()/GetAlbums() remap pipeline (expensive - MediaInfo/file probing per track, see the
+        // known library-mapping performance issues) - a plain Mongo album query is enough to find which tracks
+        // have a custom preset (Track.EqualizerGuid), and Name/Path is enough to identify each album (Mongo
+        // doesn't store Album.Name/Track.Name - see their [BsonIgnore] attributes - so those are filled in from
+        // the same per-album JSON file cache SaveEqualizerPresetAsync/UpdateTrackPlayedAsync already read, but
+        // only for the handful of albums that actually have an assignment, not the whole library).
+        public async Task<List<TrackEqualizerAssignment>> GetTrackEqualizerAssignmentsAsync()
+        {
+            var albums = await MongoDbClient.Instance.GetAlbumsAsync();
+            var assignedAlbums = albums.Where(album => album.Tracks.Any(track => track.EqualizerGuid != Guid.Empty)).ToList();
+
+            if (!assignedAlbums.Any()) return new List<TrackEqualizerAssignment>();
+
+            var cachedFilePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
+            var assignments = new List<TrackEqualizerAssignment>();
+
+            foreach (var album in assignedAlbums)
+            {
+                var cachedAlbum = ReadCachedAlbum(cachedFilePaths, album.Guid);
+
+                foreach (var track in album.Tracks.Where(track => track.EqualizerGuid != Guid.Empty))
+                {
+                    var cachedTrack = cachedAlbum?.Tracks.Find(cachedAlbumTrack => string.Equals(cachedAlbumTrack.Path, track.Path));
+
+                    assignments.Add(new TrackEqualizerAssignment
+                    {
+                        AlbumName = cachedAlbum?.Name ?? Path.GetFileName(album.Path),
+                        AlbumPath = album.Path,
+                        TrackName = cachedTrack?.Name ?? Path.GetFileNameWithoutExtension(track.Path),
+                        TrackPath = track.Path,
+                        PresetGuid = track.EqualizerGuid,
+                    });
+                }
+            }
+
+            return assignments;
+        }
+
+        // Mirrors Player.SaveEqualizerPresetAsync's per-track-preset logic, but parameterized by an explicit
+        // trackPath instead of pulling it from _playlistProvider.CurrentProvider - that method only ever makes
+        // sense for "whatever's currently playing," which isn't the track being edited when this is called from
+        // the Settings track-assignments list (that track may not be playing, or anything may be playing).
+        public async Task UpdateTrackEqualizerPresetAsync(string trackPath, EqualizerPreset preset)
+        {
+            var existingPreset = await MongoDbClient.Instance.GetEqualizerPresetAsync(trackPath);
+
+            if (existingPreset != null)
+            {
+                existingPreset.FrequencyBands = preset.FrequencyBands;
+                await MongoDbClient.Instance.UpdateEqualizerPresetAsync(existingPreset);
+                await SyncTrackEqualizerGuidAsync(Path.GetDirectoryName(trackPath), trackPath, existingPreset.Guid);
+                return;
+            }
+
+            var newPreset = new EqualizerPreset
+            {
+                Id = ObjectId.Empty,
+                Guid = Guid.NewGuid(),
+                Name = trackPath,
+                IsDefault = false,
+                FrequencyBands = preset.FrequencyBands,
+            };
+            await MongoDbClient.Instance.InsertEqualizerPresetAsync(newPreset);
+            await SyncTrackEqualizerGuidAsync(Path.GetDirectoryName(trackPath), trackPath, newPreset.Guid);
+        }
+
+        // Permanently deletes a track's custom preset document and resets the track back to whatever the
+        // player's default/merged preset resolves to. Renamed from ClearTrackEqualizerPresetAsync - the
+        // behavior was always a real delete (nothing kept the preset around for reuse), the old name just
+        // undersold that, which read as "just unassigns" rather than "gone for good."
+        public async Task DeleteTrackEqualizerPresetAsync(string trackPath)
+        {
+            var preset = await MongoDbClient.Instance.GetEqualizerPresetAsync(trackPath);
+
+            if (preset != null)
+                await MongoDbClient.Instance.DeleteEqualizerPresetAsync(preset.Guid);
+
+            await SyncTrackEqualizerGuidAsync(Path.GetDirectoryName(trackPath), trackPath, Guid.Empty);
+        }
+
+        // Called when a NAMED preset is deleted from Settings (Player.DeleteEqualizerPresetAsync) - any track
+        // that had it assigned would otherwise keep pointing at a Guid that no longer resolves to anything.
+        public async Task ClearEqualizerPresetReferencesAsync(Guid guid)
+        {
+            var assignments = await GetTrackEqualizerAssignmentsAsync();
+
+            foreach (var assignment in assignments.Where(assignment => assignment.PresetGuid == guid))
+                await SyncTrackEqualizerGuidAsync(assignment.AlbumPath, assignment.TrackPath, Guid.Empty);
+        }
+
+        #endregion Equalizer Assignments
 
         #endregion Public Functions
 
@@ -783,6 +879,38 @@ namespace MusicPlayer.LibraryManagement
 
                 return null;
             }
+        }
+
+        // Full deserialize (unlike ReadCachedAlbumPath above) - only called for the handful of albums that
+        // actually have a track equalizer assignment, so the cost of reading Tracks/Image in full is fine here.
+        private Album ReadCachedAlbum(IEnumerable<string> cachedFilePaths, Guid albumGuid)
+        {
+            var filePath = cachedFilePaths.FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), albumGuid.ToString()));
+            if (filePath == null) return null;
+
+            return JsonConvert.DeserializeObject<Album>(FileManager.Instance.Read(filePath), settings: JsonSerializationHelper.FileSerializerSettings);
+        }
+
+        // Keeps a track's EqualizerGuid in sync across both persistence layers - the Mongo Album document (source
+        // of truth for playback/mapping) and its JSON file cache mirror (what GetTrackInformation/ReadCachedAlbum
+        // read back for display) - same two-write pattern already used by UpdateTrackPlayedAsync/
+        // UpdateIsFavoriteTrackAsync above, just for EqualizerGuid instead of TimesPlayed/IsFavourite.
+        private async Task SyncTrackEqualizerGuidAsync(string albumPath, string trackPath, Guid guid)
+        {
+            var album = await MongoDbClient.Instance.GetAlbumAsync(albumPath);
+            var track = album?.Tracks.Find(albumTrack => string.Equals(albumTrack.Path, trackPath));
+            if (track == null) return;
+
+            track.EqualizerGuid = guid;
+            await MongoDbClient.Instance.UpdateAlbumAsync(album);
+
+            var cachedFilePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
+            var cachedAlbum = ReadCachedAlbum(cachedFilePaths, album.Guid);
+            var cachedTrack = cachedAlbum?.Tracks.Find(albumTrack => string.Equals(albumTrack.Path, trackPath));
+            if (cachedTrack == null) return;
+
+            cachedTrack.EqualizerGuid = guid;
+            FileManager.Instance.Write(cachedAlbum);
         }
 
         #endregion Private Functions

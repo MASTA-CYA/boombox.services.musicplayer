@@ -29,13 +29,20 @@ namespace MusicPlayer.Player
             var previousElement = _previous;
             Reset();
 
-            while (!_current.Equals(previousElement))
+            // Bounded by HasNext (and null-guarded) rather than looping purely on inequality - if
+            // previousElement is no longer in _source (e.g. it was removed from the playlist), _current would
+            // never equal it and MoveNext() keeps returning false once exhausted without changing _current,
+            // spinning forever. Best effort now: walk as far as possible, then stop at whatever's left.
+            while (_current != null && !_current.Equals(previousElement) && HasNext)
                 MoveNext();
         }
 
         public void MoveToElement(T element)
         {
-            while (!_current.Equals(element))
+            // See ResetToPreviousElement - same unbounded-loop risk if element was removed from _source (e.g.
+            // DynamicPlaylistSampleProvider.ResetEnumerator trying to re-locate a just-finished track that was
+            // also just deleted from the playlist) between when it was captured and when this runs.
+            while (_current != null && !_current.Equals(element) && HasNext)
                 MoveNext();
         }
 

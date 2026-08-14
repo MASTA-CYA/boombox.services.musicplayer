@@ -238,6 +238,7 @@
     <Compile Include="Player\Models\ProviderPathsEventArgs.cs" />
     <Compile Include="Player\Models\CurrentProviderEventArgs.cs" />
     <Compile Include="Player\Models\QueuedProviderInstruction.cs" />
+    <Compile Include="Player\Models\TrackEqualizerAssignment.cs" />
     <Compile Include="Player\Sample Providers\DynamicPlaylistSampleProvider.cs" />
     <Compile Include="Player\Sample Providers\EnhancedAudioFileReader.cs" />
     <Compile Include="Player\Models\PlaybackInformation.cs" />

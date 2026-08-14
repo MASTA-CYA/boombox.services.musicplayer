@@ -1,4 +1,6 @@
 ﻿using Microsoft.AspNetCore.SignalR;
+using MusicPlayer.Common;
+using MusicPlayer.LibraryManagement;
 using MusicPlayer.Player;
 using MusicPlayer.Player.Models;
 using MusicServer.Helpers;
@@ -64,10 +66,14 @@ namespace MusicServer.Hubs
             await SendPlaybackInformationAsync();
         }
 
+        // Broadcasts immediately afterward for the same reason ReorderNowPlayingAsync/SetAudioOutputAsync do -
+        // PlaybackBroadcast's 500ms loop only runs while something is actually playing, so without this,
+        // deleting a track while paused/stopped would update the backend but never reach the UI until playback
+        // resumed.
         public async Task RemoveNowPlayingTrackAsync(string[] paths)
         {
             ExecuteOnPlayerThread(() => RemoveNowPlayingTrack(paths));
-            await Task.CompletedTask;
+            await SendPlaybackInformationAsync();
         }
 
         public async Task AddToNowPlayingAsync(string[] paths, bool canAppend, string? indexPath)
@@ -87,6 +93,41 @@ namespace MusicServer.Hubs
             ExecuteOnPlayerThread(() => ApplyEqualizerPreset(preset));
             await Task.CompletedTask;
         }
+
+        // Everything below backs Settings' "Equalizer" tab. None of it touches the live audio pipeline
+        // (_playlistProvider/_audioPlayer) the way Play/Pause/SetAudioOutput/SetEqualizerPresets above do, so
+        // unlike those, there's no need to marshal onto the STA player thread via ExecuteOnPlayerThread - it's
+        // plain Mongo/JSON I/O and can run directly on whatever thread SignalR invokes this on.
+        public async Task<string> GetEqualizerManagementDataAsync()
+        {
+            var presets = await MongoDbClient.Instance.GetEqualizerPresetsAsync();
+            var assignments = await LibraryManager.Instance.GetTrackEqualizerAssignmentsAsync();
+            return JsonConvert.SerializeObject(new { presets, assignments }, JsonSerializationHelper.NamingSerializerSettings);
+        }
+
+        public async Task<string> CreateEqualizerPresetAsync(string name)
+        {
+            var preset = await Player.Instance.CreateEqualizerPresetAsync(name);
+            return JsonConvert.SerializeObject(preset, JsonSerializationHelper.NamingSerializerSettings);
+        }
+
+        public async Task UpdateNamedEqualizerPresetAsync(EqualizerPreset preset) => await Player.Instance.UpdateNamedEqualizerPresetAsync(preset);
+
+        public async Task DeleteEqualizerPresetAsync(Guid guid) => await Player.Instance.DeleteEqualizerPresetAsync(guid);
+
+        // GetEqualizerManagementDataAsync's assignment list is deliberately lightweight (album/track name, path,
+        // and just the assigned preset's Guid - see TrackEqualizerAssignment) rather than embedding every
+        // assignment's full band data up front. This fetches one specific per-track preset's full bands, on
+        // demand, only when the user actually opens it for editing.
+        public async Task<string> GetTrackEqualizerPresetAsync(string trackPath)
+        {
+            var preset = await MongoDbClient.Instance.GetEqualizerPresetAsync(trackPath);
+            return JsonConvert.SerializeObject(preset, JsonSerializationHelper.NamingSerializerSettings);
+        }
+
+        public async Task UpdateTrackEqualizerPresetAsync(string trackPath, EqualizerPreset preset) => await LibraryManager.Instance.UpdateTrackEqualizerPresetAsync(trackPath, preset);
+
+        public async Task DeleteTrackEqualizerPresetAsync(string trackPath) => await LibraryManager.Instance.DeleteTrackEqualizerPresetAsync(trackPath);
 
         // Runs on the same STA player thread as every other action here - both AsioOut and WasapiOut are
         // COM-based. Broadcasts the updated PlaybackInformation immediately afterward rather than waiting for

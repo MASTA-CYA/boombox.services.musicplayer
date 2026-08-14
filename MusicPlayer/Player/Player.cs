@@ -76,6 +76,23 @@ namespace MusicPlayer.Player
             }
 
             (_activeOutput, _activeMode) = LoadPlayerSettingsAsync().GetAwaiter().GetResult();
+
+            // The persisted preference can be Headset from a previous session where the HS80 was plugged in.
+            // Previously this was trusted blindly here, so ApplyPersistedSettingsToPlayerState() would report
+            // Headset as active (and the sidebar would show it lit up) from the very first broadcast, even
+            // though playback would silently fall back to speakers the moment something actually played - see
+            // CreateAudioPlayer(), which only ran (and only corrected _activeOutput) once Play() was called.
+            // Validating it here means the UI is correct before any playback starts. Also persists the
+            // correction to Mongo (same fire-and-forget pattern SetAudioOutput/TogglePlaybackMode use) so the
+            // next launch starts from Speakers too, rather than re-discovering the same unavailability every
+            // time - the user has to deliberately pick Headset again once it's back.
+            if (_activeOutput == AudioOutput.Headset && !IsHeadsetDeviceAvailable())
+            {
+                _logger.LogWarning("Persisted audio output is Headset but no active device matching \"{Substring}\" was found; defaulting to speakers", HEADSET_DEVICE_NAME_SUBSTRING);
+                _activeOutput = AudioOutput.Speakers;
+                _ = Task.Run(async () => await SavePlayerSettingsAsync());
+            }
+
             _logger.LogInformation("Starting with audio output {AudioOutput}, playback mode {PlaybackMode}", _activeOutput, _activeMode);
 
             PrepareEqualizerPresets();
@@ -170,14 +187,7 @@ namespace MusicPlayer.Player
         {
             if (_activeOutput == AudioOutput.Headset)
             {
-                // Classic using(){} block rather than a C# 8 using declaration - MusicPlayer targets C# 7.3 (see
-                // the same note on library mapping's Parallel.ForEachAsync avoidance), which doesn't support it.
-                MMDevice headsetDevice;
-                using (var enumerator = new MMDeviceEnumerator())
-                {
-                    headsetDevice = enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-                        .FirstOrDefault(device => device.FriendlyName?.IndexOf(HEADSET_DEVICE_NAME_SUBSTRING, StringComparison.OrdinalIgnoreCase) >= 0);
-                }
+                var headsetDevice = FindHeadsetDevice();
 
                 if (headsetDevice != null)
                 {
@@ -191,6 +201,22 @@ namespace MusicPlayer.Player
 
             return new AsioOut(_activeDriver);
         }
+
+        // Shared by CreateAudioPlayer() (actual playback) and the startup validation in the constructor (UI
+        // correctness before anything has played) - both need the same "is the HS80 actually reachable right
+        // now" answer.
+        private static MMDevice FindHeadsetDevice()
+        {
+            // Classic using(){} block rather than a C# 8 using declaration - MusicPlayer targets C# 7.3 (see
+            // the same note on library mapping's Parallel.ForEachAsync avoidance), which doesn't support it.
+            using (var enumerator = new MMDeviceEnumerator())
+            {
+                return enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
+                    .FirstOrDefault(device => device.FriendlyName?.IndexOf(HEADSET_DEVICE_NAME_SUBSTRING, StringComparison.OrdinalIgnoreCase) >= 0);
+            }
+        }
+
+        private static bool IsHeadsetDeviceAvailable() => FindHeadsetDevice() != null;
 
         // _playbackInformation gets replaced wholesale (`new PlaybackInformation()`) in both InitializePlayer()
         // and Play(), which resets PlayerState back to its class defaults (Speakers/Sequential) regardless of
@@ -311,7 +337,18 @@ namespace MusicPlayer.Player
 
                     if (_playlistProvider == null || _queuedPlaylist == null) return;
 
-                    if (_playlistProvider.Providers.Count() != _queuedPlaylist.Count) return;
+                    // Only bail when the display list (_queuedPlaylist) has MORE entries than the engine can
+                    // currently account for (Providers) - that's the genuinely unsafe case below, where .First()
+                    // over _queuedPlaylist could fail to find a match (e.g. mid-merge right after AddToNowPlaying,
+                    // before DynamicPlaylistSampleProvider.AddQueuedProviders has run). The reverse - Providers
+                    // temporarily containing MORE than _queuedPlaylist, e.g. right after RemoveNowPlayingTrack,
+                    // before AddQueuedProviders purges the removal from _providers at the next track change - is
+                    // safe to proceed with, since every _queuedPlaylist track is still guaranteed to be found.
+                    // Previously this bailed on ANY mismatch, which froze every field below (IsPlaying, HasNext,
+                    // PlayedDuration, Tracks, etc.) from the moment a track was deleted until the current track
+                    // happened to end - and since AddQueuedProviders never actually purged the removal when
+                    // nothing else was queued (see the fix there), it stayed frozen forever, not just briefly.
+                    if (_queuedPlaylist.Count > _playlistProvider.Providers.Count()) return;
 
                     foreach (var trackInfo in _queuedPlaylist)
                     {
@@ -461,6 +498,51 @@ namespace MusicPlayer.Player
             trackPreset.Name = "Saved";
             return EqualizerPresets.ToList().Prepend(trackPreset).ToList();
         }
+
+        // Everything below manages the shared, NAMED preset library (Flat/Hip Hop/etc. - what shows up in the
+        // player's own preset dropdown) from Settings' "Equalizer" tab - distinct from SaveEqualizerPresetAsync
+        // above, which always writes to whatever track is currently playing, keyed by its path rather than a
+        // preset name. EqualizerPresets is only ever populated once, in the constructor - without refreshing it
+        // here too, a preset created/edited/deleted from Settings wouldn't show up in the player's own dropdown
+        // (or would keep offering a just-deleted one) until the app restarted.
+        public async Task<EqualizerPreset> CreateEqualizerPresetAsync(string name)
+        {
+            var templateBands = EqualizerPresets.FirstOrDefault(presetTemplate => string.Equals(presetTemplate.Name, "Flat"))?.FrequencyBands
+                ?? EqualizerPresets.FirstOrDefault()?.FrequencyBands;
+
+            var preset = new EqualizerPreset
+            {
+                Name = name,
+                IsDefault = true,
+                FrequencyBands = templateBands?.Select(band => new EqualizerFrequencyBand
+                {
+                    Name = band.Name,
+                    Frequency = band.Frequency,
+                    Min = band.Min,
+                    Max = band.Max,
+                    Gain = 0
+                }).ToList() ?? new List<EqualizerFrequencyBand>(),
+            };
+
+            await MongoDbClient.Instance.InsertEqualizerPresetAsync(preset);
+            await RefreshEqualizerPresetsAsync();
+            return preset;
+        }
+
+        public async Task UpdateNamedEqualizerPresetAsync(EqualizerPreset preset)
+        {
+            await MongoDbClient.Instance.UpdateEqualizerPresetAsync(preset);
+            await RefreshEqualizerPresetsAsync();
+        }
+
+        public async Task DeleteEqualizerPresetAsync(Guid guid)
+        {
+            await MongoDbClient.Instance.DeleteEqualizerPresetAsync(guid);
+            await LibraryManager.Instance.ClearEqualizerPresetReferencesAsync(guid);
+            await RefreshEqualizerPresetsAsync();
+        }
+
+        private async Task RefreshEqualizerPresetsAsync() => EqualizerPresets = await MongoDbClient.Instance.GetEqualizerPresetsAsync();
 
         #region Dispose Pattern
         private void Dispose(bool disposing)

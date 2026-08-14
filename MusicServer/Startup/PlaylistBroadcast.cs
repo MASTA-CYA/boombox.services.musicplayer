@@ -51,12 +51,15 @@ namespace MusicServer.Startup
         {
             using var timer = new PeriodicTimer(TimeSpan.FromMilliseconds(2000));
 
+            // Kept across ticks rather than re-declared inside the loop (the old `List<Playlist> playlists = []`
+            // was local to each iteration) - see the "deliberately doesn't broadcast" comment below for why.
+            List<Playlist> lastKnownGoodPlaylists = [];
+            bool isCurrentlyFailing = false;
+
             try
             {
                 while (await timer.WaitForNextTickAsync(token))
                 {
-                    List<Playlist> playlists = [];
-
                     try
                     {
                         // Used to also merge in a "Playlists" Redis key here, but nothing in the app ever wrote
@@ -66,17 +69,40 @@ namespace MusicServer.Startup
                         // silenced: caching the full playlist JSON in Redis would be a meaningful amount of data to
                         // push through it on every read anyway, so Mongo-only is the right shape here, not just a
                         // fallback.
-                        playlists = await PlaylistManager.Instance.GetPlaylistsAsync();
+                        lastKnownGoodPlaylists = await PlaylistManager.Instance.GetPlaylistsAsync();
+
+                        // Only log the "back to normal" transition, not every single healthy tick - LogInformation
+                        // is below SignalRErrorSink's Warning threshold (see Program.cs), so this doesn't toast;
+                        // it's here for the server log only.
+                        if (isCurrentlyFailing)
+                        {
+                            _logger.LogInformation("Playlist loading recovered");
+                            isCurrentlyFailing = false;
+                        }
                     }
                     catch (Exception ex)
                     {
-                        _logger.LogWarning(ex, "Unable to load playlists");
+                        // Edge-triggered: only log (and therefore toast, via SignalRErrorSink) once, when an
+                        // outage STARTS - not on every failed 2-second tick for its entire duration. A transient
+                        // Mongo blip lasting 30+ seconds (a real one prompted this fix - MongoConnectionException/
+                        // socket timeout, not an app bug) previously produced a fresh "Unable to load playlists"
+                        // toast every single tick, stacking up dozens of near-identical notifications for what
+                        // was really one ongoing problem.
+                        if (!isCurrentlyFailing)
+                        {
+                            _logger.LogWarning(ex, "Unable to load playlists");
+                            isCurrentlyFailing = true;
+                        }
+
+                        // Deliberately skips broadcasting here rather than falling through to send an empty list
+                        // (the old `finally` block always sent, even on failure) - a transient outage shouldn't
+                        // wipe out every client's already-displayed playlists just because this one fetch failed;
+                        // better to keep showing the last known good data until a fresh fetch actually succeeds.
+                        continue;
                     }
-                    finally
-                    {
-                        var playlistJson = JsonSerializer.Serialize(playlists, JsonSerializationHelper.SerializerOptions);
-                        await _playlistHub.Clients.All.SendAsync("ReceivePlaylists", playlistJson, token);
-                    }
+
+                    var playlistJson = JsonSerializer.Serialize(lastKnownGoodPlaylists, JsonSerializationHelper.SerializerOptions);
+                    await _playlistHub.Clients.All.SendAsync("ReceivePlaylists", playlistJson, token);
                 }
             }
             catch (Exception ex)

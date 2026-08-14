@@ -65,6 +65,12 @@ namespace MusicServer.Startup
                     await _playerHub.Clients.All.SendAsync("ReceivePlaybackInformation", playbackInfoJson, token);
                 }
             }
+            catch (OperationCanceledException)
+            {
+                // Expected whenever Stop() cancels the token while a SendAsync write happens to be in flight
+                // (e.g. reaching the end of the playlist) - Stop() has already nulled _cts and this wasn't a
+                // real failure, so it shouldn't be logged as an error or trigger the self-heal restart below.
+            }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Playback information broadcast loop failed");
