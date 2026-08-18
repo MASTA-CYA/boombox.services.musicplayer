@@ -231,6 +231,13 @@
     <Compile Include="AutoScrollManagement\Models\ScrollPosition.cs" />
     <Compile Include="LibraryManagement\Models\Track.cs" />
     <Compile Include="LibraryManagement\Models\TrackUserData.cs" />
+    <Compile Include="LyricsManagement\Models\Lyrics.cs" />
+    <Compile Include="LyricsManagement\Models\LyricsLine.cs" />
+    <Compile Include="LyricsManagement\Models\LyricsSource.cs" />
+    <Compile Include="LyricsManagement\LrcParser.cs" />
+    <Compile Include="LyricsManagement\LrclibResponse.cs" />
+    <Compile Include="LyricsManagement\LrclibClient.cs" />
+    <Compile Include="LyricsManagement\LyricsManager.cs" />
     <Compile Include="AutoScrollManagement\ScrollManager.cs" />
     <Compile Include="LibraryManagement\Models\UserData.cs" />
     <Compile Include="Player\Models\EqualizerFrequencyBand.cs" />

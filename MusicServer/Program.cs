@@ -2,6 +2,7 @@
 using Microsoft.AspNetCore.SignalR;
 using MusicPlayer.Common;
 using MusicPlayer.FileManagement;
+using MusicPlayer.LibraryManagement;
 using MusicServer.Hubs;
 using MusicServer.Startup;
 using Serilog;
@@ -129,6 +130,11 @@ namespace MusicServer
         {
             await Task.CompletedTask;
             FileManager.Instance.ClearDirectory(Constants.RESAMPLED_PROVIDERS_DIRECTORY);
+
+            // One-time backfill into the new trackUserData collection - a cheap no-op after the first run (see
+            // MigrateTrackUserDataIfNeededAsync's own empty-collection guard). Awaited here, before any hub is
+            // mapped, so nothing can read trackUserData before the migration has had a chance to populate it.
+            await LibraryManager.Instance.MigrateTrackUserDataIfNeededAsync();
         }
     }
 }

@@ -1,6 +1,7 @@
 ﻿using Microsoft.AspNetCore.SignalR;
 using MusicPlayer.Common;
 using MusicPlayer.LibraryManagement;
+using MusicPlayer.LyricsManagement;
 using MusicPlayer.Player;
 using MusicPlayer.Player.Models;
 using MusicServer.Helpers;
@@ -136,6 +137,23 @@ namespace MusicServer.Hubs
         public async Task UpdateTrackEqualizerPresetAsync(string trackPath, EqualizerPreset preset) => await LibraryManager.Instance.UpdateTrackEqualizerPresetAsync(trackPath, preset);
 
         public async Task DeleteTrackEqualizerPresetAsync(string trackPath) => await LibraryManager.Instance.DeleteTrackEqualizerPresetAsync(trackPath);
+
+        // Lyrics, same reasoning as the equalizer management block above - LyricsManager.GetLyricsAsync is
+        // plain Mongo I/O plus (on a cache miss only) a tag read/LRCLIB call/sidecar file read, none of which
+        // touch the live audio pipeline, so no ExecuteOnPlayerThread needed. That first-time cache-miss lookup
+        // is why this one can occasionally take noticeably longer than everything else in this file (an LRCLIB
+        // round-trip) - every call after the first for a given track is a single fast Mongo lookup.
+        public async Task<string> GetTrackLyricsAsync(string trackPath)
+        {
+            var lyrics = await LyricsManager.Instance.GetLyricsAsync(trackPath);
+            return JsonConvert.SerializeObject(lyrics, JsonSerializationHelper.NamingSerializerSettings);
+        }
+
+        public async Task<string> SaveManualLyricsAsync(string trackPath, string rawText)
+        {
+            var lyrics = await LyricsManager.Instance.SaveManualLyricsAsync(trackPath, rawText);
+            return JsonConvert.SerializeObject(lyrics, JsonSerializationHelper.NamingSerializerSettings);
+        }
 
         // Runs on the same STA player thread as every other action here - both AsioOut and WasapiOut are
         // COM-based. Broadcasts the updated PlaybackInformation immediately afterward rather than waiting for

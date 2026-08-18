@@ -56,8 +56,12 @@ namespace MusicPlayer.LibraryManagement
         public async Task<List<Album>> GetAlbumsAsync()
         {
             var databaseAlbums = await GetCachedDatabaseAlbumsAsync();
-            var cachedFavouriteTracks = (await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks;
-            var mappedAlbums = await Task.Run(() => GetAlbums(databaseAlbums, cachedFavouriteTracks));
+            // One bulk fetch for the whole (small) trackUserData collection instead of a per-track Mongo
+            // lookup, indexed case-insensitively so a track's path casing drifting between when it was
+            // favourited and now (Windows filesystems are case-insensitive but case-preserving) can't cause a
+            // lookup miss - see BuildUserDataLookup and the track-user-data design notes.
+            var userDataLookup = BuildUserDataLookup(await MongoDbClient.Instance.GetAllTrackUserDataAsync());
+            var mappedAlbums = await Task.Run(() => GetAlbums(databaseAlbums, userDataLookup));
             _ = Task.Run(async () => await UpsertMappedAlbumsAsync(mappedAlbums));
             return mappedAlbums.ToList();
         }
@@ -78,8 +82,8 @@ namespace MusicPlayer.LibraryManagement
             }
 
             var mediaInfo = new MediaInfoWrapper(filePath);
-            var savedAlbum = Task.Run(async () => await MongoDbClient.Instance.GetAlbumAsync(directory.FullName)).GetAwaiter().GetResult();
-            var isFavourite = savedAlbum.Tracks.Find(track => string.Equals(track.Path, filePath)).IsFavourite;
+            var userData = Task.Run(async () => await MongoDbClient.Instance.GetTrackUserDataAsync(filePath)).GetAwaiter().GetResult();
+            var isFavourite = userData?.IsFavourite ?? false;
             var preset = Task.Run(async () => await MongoDbClient.Instance.GetEqualizerPresetAsync(filePath)).GetAwaiter().GetResult();
 
             return new PlaylistTrack
@@ -95,50 +99,117 @@ namespace MusicPlayer.LibraryManagement
             };
         }
 
+        // TimesPlayed now lives solely in the trackUserData collection (one atomic $inc, no read-modify-write) -
+        // it used to also be patched into the Album's Mongo document and its per-album AppData JSON file mirror
+        // by hand, on every single play. Neither is needed anymore: GetAlbums/MapAlbumTrackMetaData read
+        // TimesPlayed straight from trackUserData at load time (see the remap rewiring), so a stale value left
+        // behind in the JSON mirror is simply never consulted.
         public async Task UpdateTrackPlayedAsync(string path)
         {
-            var albumPath = Path.GetDirectoryName(path);
-            await MongoDbClient.Instance.UpdateTimesPlayedAsync(albumPath: albumPath, trackPath: path);
-
-            var filePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
-            var cachedAlbum = await MongoDbClient.Instance.GetAlbumAsync(albumPath);
-            var appDataPath = filePaths.FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), cachedAlbum.Guid.ToString()));
-            var albumFileContent = FileManager.Instance.Read(appDataPath);
-            var album = JsonConvert.DeserializeObject<Album>(albumFileContent, settings: JsonSerializationHelper.FileSerializerSettings);
-            var playedTrack = album.Tracks.Find(track => string.Equals(track.Path, path));
-            playedTrack.TimesPlayed = cachedAlbum.Tracks.Find(track => string.Equals(track.Path, path)).TimesPlayed;
-            FileManager.Instance.Write(album);
-
+            await MongoDbClient.Instance.IncrementTimesPlayedAsync(path);
             await UpdateTrackUserDataAsync(path);
         }
 
+        // Was a three-way write (the Album's embedded Track.IsFavourite field via a full-document
+        // read-modify-write, the "Favourite" playlist, and the per-album AppData JSON file mirror, patched by
+        // hand in three separate steps with no transaction tying them together - see the track-user-data
+        // design discussion for how that caused favourites to silently appear "reset"). Now a single atomic
+        // upsert against trackUserData is the only thing that has to succeed for the toggle itself to be
+        // durable; the playlist sync below is real but explicitly best-effort and secondary.
         public async Task UpdateIsFavoriteTrackAsync(string path)
         {
             try
             {
-                var (isFasvourite, guid) = await MongoDbClient.Instance.UpdateIsFavouriteAsync(albumPath: Path.GetDirectoryName(path), trackPath: path);
-                UpdatedFavouriteTrack?.Invoke(this, new FavouriteTrackEventArgs(path, isFasvourite));
-
-                var track = ((await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks?.Find(playlistTrack => string.Equals(playlistTrack.Path, path)))
-                    ?? GetTrackInformation(path);
-
+                var isFavourite = await MongoDbClient.Instance.ToggleFavouriteAsync(path);
+                UpdatedFavouriteTrack?.Invoke(this, new FavouriteTrackEventArgs(path, isFavourite));
                 await UpdateTrackUserDataAsync(path);
 
-                if (isFasvourite)
-                    await MongoDbClient.Instance.AddPlaylistTracksAsync("Favourite", new List<PlaylistTrack> { track });
-                else
-                    await MongoDbClient.Instance.RemovePlaylistTracksAsync("Favourite", new List<PlaylistTrack> { track });
+                // The "Favourite" playlist is a real playable playlist ("play my favourites"), so it's still
+                // kept in sync here - but it's no longer what display state is computed from (see
+                // GetAlbums/MapAlbumTrackMetaData), so a failure in this block can no longer corrupt what the
+                // UI shows the way it used to; it just means the playlist itself lags until the next toggle.
+                try
+                {
+                    var track = GetTrackInformation(path);
 
-                var appDataPath = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN).FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), guid));
-                var albumFileContent = FileManager.Instance.Read(appDataPath);
-                var album = JsonConvert.DeserializeObject<Album>(albumFileContent, settings: JsonSerializationHelper.FileSerializerSettings);
-                var favouriteTrack = album.Tracks.Find(albumTrack => string.Equals(albumTrack.Path, path));
-                favouriteTrack.IsFavourite = isFasvourite;
-                FileManager.Instance.Write(album);
+                    if (isFavourite)
+                        await MongoDbClient.Instance.AddPlaylistTracksAsync("Favourite", new List<PlaylistTrack> { track });
+                    else
+                        await MongoDbClient.Instance.RemovePlaylistTracksAsync("Favourite", new List<PlaylistTrack> { track });
+                }
+                catch (Exception playlistEx)
+                {
+                    _logger.LogWarning(playlistEx, "Unable to sync Favourite playlist for {Path}", path);
+                }
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Unable to update favourite state for {Path}", path);
+            }
+        }
+
+        // One-time backfill for the trackUserData consolidation - before this, favourite/times-played state
+        // lived embedded in each Album document's Tracks[] AND separately in the "Favourite" playlist, with no
+        // guarantee the two agreed. Runs once (guarded by the collection actually being empty, so it's a cheap
+        // no-op on every startup after the first) and unions both old sources rather than picking one, so
+        // nothing a user had already favourited or played gets silently dropped by the migration itself.
+        // Called from MusicServer's startup sequence, awaited, before anything else can read trackUserData.
+        public async Task MigrateTrackUserDataIfNeededAsync()
+        {
+            try
+            {
+                var alreadyMigrated = (await MongoDbClient.Instance.GetAllTrackUserDataAsync()).Any();
+                if (alreadyMigrated) return;
+
+                var albums = await MongoDbClient.Instance.GetAlbumsAsync();
+                var favouritePlaylist = await MongoDbClient.Instance.GetPlaylistAsync("Favourite");
+                var favouritePaths = new HashSet<string>(
+                    favouritePlaylist?.Tracks.Select(track => track.Path) ?? Enumerable.Empty<string>(),
+                    StringComparer.OrdinalIgnoreCase);
+
+                var merged = new Dictionary<string, TrackUserData>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var album in albums)
+                {
+                    foreach (var track in album.Tracks ?? new List<Track>())
+                    {
+                        if (string.IsNullOrWhiteSpace(track.Path)) continue;
+
+                        if (!merged.TryGetValue(track.Path, out var data))
+                        {
+                            data = new TrackUserData { Id = ObjectId.GenerateNewId(), Path = track.Path, UpdatedAtUtc = DateTime.UtcNow };
+                            merged[track.Path] = data;
+                        }
+
+                        // Max, not overwrite - a track's path can theoretically appear in more than one saved
+                        // Album snapshot (e.g. a stale duplicate left over from a moved directory); keeping the
+                        // higher play count is the safer direction to err in for a migration.
+                        data.TimesPlayed = Math.Max(data.TimesPlayed, track.TimesPlayed);
+                        data.IsFavourite = data.IsFavourite || track.IsFavourite || favouritePaths.Contains(track.Path);
+                    }
+                }
+
+                // Covers any Favourite-playlist track that isn't attached to a currently-mapped album at all -
+                // rare (e.g. the album was since moved or deleted), but a real case this loop alone would miss.
+                foreach (var path in favouritePaths)
+                {
+                    if (merged.ContainsKey(path)) continue;
+                    merged[path] = new TrackUserData { Id = ObjectId.GenerateNewId(), Path = path, IsFavourite = true, UpdatedAtUtc = DateTime.UtcNow };
+                }
+
+                if (!merged.Any()) return;
+
+                await MongoDbClient.Instance.InsertTrackUserDataBatchAsync(merged.Values);
+
+                // Warning, not Information, deliberately - see SignalRErrorSink: this is the one and only time
+                // this migration ever runs, and surfacing it as a toast is a useful, reassuring confirmation it
+                // actually happened, the same reasoning AudioOutputAvailabilityBroadcast's forced-switch
+                // notification already uses this mechanism for.
+                _logger.LogWarning("Migrated {Count} track user data records into the new trackUserData collection", merged.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unable to migrate track user data");
             }
         }
 
@@ -223,9 +294,23 @@ namespace MusicPlayer.LibraryManagement
         public async Task RefreshAlbumAsync(string path)
         {
             var databaseAlbum = await GetCachedDatabaseAlbumAsync(path);
-            var cachedFavouriteTracks = (await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks;
+            var userDataLookup = BuildUserDataLookup(await MongoDbClient.Instance.GetAllTrackUserDataAsync());
 
-            var mappedAlbum = RefreshMappedAlbum(path, databaseAlbum, cachedFavouriteTracks);
+            var mappedAlbum = RefreshMappedAlbum(path, databaseAlbum, userDataLookup);
+
+            // RefreshMappedAlbum returns null for a handful of legitimate reasons (excluded directory, no audio
+            // files left, unreadable tags leaving Name/Artist unresolved) - previously this fell straight
+            // through and serialized/wrote a null album: SelectedAlbum became the literal string "null", and
+            // both background tasks below threw on mappedAlbum.Guid/.Id before doing anything (harmless on
+            // their own, since BulkWriteAsync failing doesn't touch the existing document) but the swallowed
+            // exceptions made this fail silently instead of leaving the previously cached album in place, which
+            // is the correct behavior when a refresh can't produce anything better.
+            if (mappedAlbum == null)
+            {
+                _logger.LogError("Refresh produced no album for {Path} — leaving the previously cached album in place", path);
+                return;
+            }
+
             SelectedAlbum = JsonConvert.SerializeObject(mappedAlbum, JsonSerializationHelper.NamingSerializerSettings);
             _ = Task.Run(async () => await UpsertMappedAlbumsAsync(new ConcurrentBag<Album> { mappedAlbum }));
             _ = Task.Run(() => FileManager.Instance.Write(mappedAlbum));
@@ -330,7 +415,7 @@ namespace MusicPlayer.LibraryManagement
 
         #region Private Functions
 
-        private ConcurrentBag<Album> GetAlbums(List<Album> databaseAlbums, List<PlaylistTrack> cachedFavouriteTracks)
+        private ConcurrentBag<Album> GetAlbums(List<Album> databaseAlbums, Dictionary<string, TrackUserData> userDataLookup)
         {
             // Reset from any previous run so a stale IsComplete/Error doesn't linger into this one — MusicServer's
             // MappingUpdateBroadcast treats IsComplete transitioning to true as "this run just finished, persist
@@ -396,7 +481,7 @@ namespace MusicPlayer.LibraryManagement
                         if (string.Equals(directoryName, "Singles"))
                         {
                             var savedSinglesAlbum = databaseAlbums?.Find(dbAlbum => string.Equals(dbAlbum.Path, directory));
-                            var singlesAlbum = MapSinglesAlbum(directory, savedSinglesAlbum, cachedFavouriteTracks, directoryInfo);
+                            var singlesAlbum = MapSinglesAlbum(directory, savedSinglesAlbum, userDataLookup, directoryInfo);
                             albums.Add(singlesAlbum);
                             continue;
                         }
@@ -434,8 +519,8 @@ namespace MusicPlayer.LibraryManagement
                                 // queued a second thread-pool thread just to block-wait on it, doubling the thread cost
                                 // of every Mongo lookup on top of the Parallel.ForEach worker already blocked here.
                                 var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
-                                var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
-                                tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
+                                userDataLookup.TryGetValue(file, out var userData);
+                                tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, presetGuid, userData));
                             }
                             catch (Exception ex)
                             {
@@ -483,7 +568,7 @@ namespace MusicPlayer.LibraryManagement
                 }
         }
 
-        private Album MapSinglesAlbum(string directory, Album savedAlbum, List<PlaylistTrack> cachedFavouriteTracks, DirectoryInfo directoryInfo)
+        private Album MapSinglesAlbum(string directory, Album savedAlbum, Dictionary<string, TrackUserData> userDataLookup, DirectoryInfo directoryInfo)
         {
             var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories).ToList();
 
@@ -515,8 +600,8 @@ namespace MusicPlayer.LibraryManagement
                     var mediaInfo = new MediaInfoWrapper(file);
                     var savedtrack = savedAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
                     var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
-                    var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
-                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
+                    userDataLookup.TryGetValue(file, out var userData);
+                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, presetGuid, userData));
                 }
                 catch (Exception ex)
                 {
@@ -561,7 +646,7 @@ namespace MusicPlayer.LibraryManagement
 
             // Fetched once here instead of once per file — the old code queried the Favourite playlist from Mongo
             // on every single track.
-            var cachedFavouriteTracks = (await MongoDbClient.Instance.GetPlaylistAsync("Favourite"))?.Tracks;
+            var userDataLookup = BuildUserDataLookup(await MongoDbClient.Instance.GetAllTrackUserDataAsync());
 
             Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
             {
@@ -571,8 +656,8 @@ namespace MusicPlayer.LibraryManagement
                 {
                     var mediaInfo = new MediaInfoWrapper(file);
                     var presetGuid = GetTrackEqualizerPresetGuidAsync(file, Guid.Empty).GetAwaiter().GetResult();
-                    var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
-                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, null, presetGuid, isFavourite));
+                    userDataLookup.TryGetValue(file, out var userData);
+                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, presetGuid, userData));
                 }
                 catch (Exception ex)
                 {
@@ -601,15 +686,26 @@ namespace MusicPlayer.LibraryManagement
             return album;
         }
 
-        private Album RefreshMappedAlbum(string path, Album databaseAlbum = null, List<PlaylistTrack> cachedFavouriteTracks = null)
+        private Album RefreshMappedAlbum(string path, Album databaseAlbum, Dictionary<string, TrackUserData> userDataLookup)
         {
             // Checked before doing any file enumeration — the old code always walked the whole directory tree and
             // scanned for images first, even for the "Singles" and excluded-directory cases where that work is
             // immediately thrown away.
-            if (string.Equals(path, "Singles"))
-                return MapSinglesAlbum(path, databaseAlbum, cachedFavouriteTracks, new DirectoryInfo(path));
-
+            //
+            // Compares the directory's NAME against "Singles", not the full path — this used to check
+            // `string.Equals(path, "Singles")`, but `path` here is the real absolute folder path (e.g.
+            // "D:\Music\Singles") passed in from the frontend's Refresh Album button, never literally the
+            // four-character string "Singles". That made the branch dead code: every Singles refresh fell
+            // through to the generic single-album path below, which derives the album's Name/Artist from
+            // whichever track happens to enumerate first in the folder — silently overwriting "Singles" /
+            // "Various Artists" with some random track's own tags on every refresh (e.g. a loose single by
+            // Sombr became the whole folder's displayed "album"). Matches the check GetAlbums() already uses
+            // correctly for the same folder during a full library mapping pass.
             var directoryInfo = new DirectoryInfo(path);
+
+            if (string.Equals(directoryInfo.Name, "Singles"))
+                return MapSinglesAlbum(path, databaseAlbum, userDataLookup, directoryInfo);
+
             var directoryName = directoryInfo.Name;
             if (_directoryExclusions.Contains(directoryName)) return null;
 
@@ -635,8 +731,8 @@ namespace MusicPlayer.LibraryManagement
                     var mediaInfo = new MediaInfoWrapper(file);
                     var savedtrack = databaseAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
                     var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
-                    var isFavourite = cachedFavouriteTracks?.Any(playlistTrack => string.Equals(playlistTrack.Path, file)) ?? false;
-                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, savedtrack, presetGuid, isFavourite));
+                    userDataLookup.TryGetValue(file, out var userData);
+                    tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, presetGuid, userData));
                 }
                 catch (Exception ex)
                 {
@@ -716,7 +812,12 @@ namespace MusicPlayer.LibraryManagement
             return 0;
         }
 
-        private Track MapAlbumTrackMetaData(MediaInfoWrapper metadata, string AlbumArtistFallback, string path, Track track, Guid presetGuid, bool isFavourite)
+        // TimesPlayed/IsFavourite now come solely from trackUserData (userData, looked up by the caller via
+        // BuildUserDataLookup) - this used to also fall back to the old Track snapshot embedded in the
+        // previous Album document (an `isFavourite || track?.IsFavourite` OR across two sources that could,
+        // and did, disagree). trackUserData is the only place this state is written now, so there's nothing
+        // left to OR against.
+        private Track MapAlbumTrackMetaData(MediaInfoWrapper metadata, string AlbumArtistFallback, string path, Guid presetGuid, TrackUserData userData)
         {
             return new Track
             {
@@ -725,12 +826,24 @@ namespace MusicPlayer.LibraryManagement
                 Name = metadata.Tags.Track,
                 Artist = GetTrackArtist(metadata.Tags.AlbumArtist, metadata.Tags.Artist, AlbumArtistFallback),
                 Duration = GetTrackDuration(metadata.Duration, path),
-                TimesPlayed = track?.TimesPlayed ?? 0,
-                IsFavourite = isFavourite || (track?.IsFavourite ?? false),
+                TimesPlayed = userData?.TimesPlayed ?? 0,
+                IsFavourite = userData?.IsFavourite ?? false,
                 EqualizerGuid = presetGuid,
                 Path = path,
             };
         }
+
+        // Bulk trackUserData -> case-insensitive lookup dictionary, shared by every remap entry point above.
+        // GroupBy+First (rather than a plain ToDictionary, which throws on a duplicate key) means this can
+        // never crash a library load even if two documents somehow end up differing only by path casing -
+        // it silently keeps whichever one it saw first instead. Windows filesystems are case-insensitive but
+        // case-preserving, which is exactly the mismatch that let favourites appear to silently reset before
+        // (see the track-user-data design notes) - this dictionary, plus the collection's own case-insensitive
+        // collation (EnsureCollectionsExistAsync), closes that gap at both layers.
+        private static Dictionary<string, TrackUserData> BuildUserDataLookup(IEnumerable<TrackUserData> userData)
+            => userData
+                .GroupBy(data => data.Path, StringComparer.OrdinalIgnoreCase)
+                .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
 
         private int GetDiscNumber(string path)
         {
@@ -791,15 +904,15 @@ namespace MusicPlayer.LibraryManagement
             }
         }
 
+        // trackUserData is now the only place this state lives, so the freshly-written document can be
+        // broadcast as-is instead of reconstructing one from an Album's embedded Track (which no longer holds
+        // the current value at all - see the write-path rewiring above).
         private async Task UpdateTrackUserDataAsync(string path)
         {
-            var track = await MongoDbClient.Instance.GetTrackAsync(albumPath: Path.GetDirectoryName(path), trackPath: path);
-            TrackUserDataChanged?.Invoke(this, new TrackUserData
-            {
-                Path = path,
-                IsFavourite = track.IsFavourite,
-                TimesPlayed = track.TimesPlayed,
-            });
+            var trackUserData = await MongoDbClient.Instance.GetTrackUserDataAsync(path);
+            if (trackUserData == null) return;
+
+            TrackUserDataChanged?.Invoke(this, trackUserData);
         }
 
         private async Task<List<Album>> GetCachedDatabaseAlbumsAsync()

@@ -458,6 +458,12 @@ namespace MusicPlayer.Player
 
         private void HandleUpdatedFavouriteTrack(object sender, FavouriteTrackEventArgs e)
         {
+            // LibraryManager.UpdatedFavouriteTrack fires for any favourite toggle app-wide (e.g. from the album
+            // view), regardless of whether a playlist is currently queued - _queuedPlaylist is null before the
+            // first track is ever loaded and again after ResetPlaylistElementsAsync, so this needs its own guard
+            // rather than assuming a queued playlist always exists by the time this handler runs.
+            if (_queuedPlaylist == null) return;
+
             var queuedTrack = _queuedPlaylist.FirstOrDefault(track => string.Equals(track.Path, e.FilePath));
             if (queuedTrack == null) return;
             queuedTrack.IsFavourite = e.IsFavourite;
