@@ -25,7 +25,19 @@ namespace MusicServer.Startup
             {
                 try
                 {
-                    var json = JsonSerializer.Serialize(data, JsonSerializationHelper.SerializerOptions);
+                    // Projected rather than serializing `data` directly - TrackUserData.Id is a MongoDB ObjectId,
+                    // and System.Text.Json has no converter for it (would throw). MusicPlayer can't carry a
+                    // System.Text.Json [JsonIgnore] on the model itself (old-style .NET Framework 4.8 project,
+                    // no reference to that assembly - see TrackUserData.cs's comment), so it's dropped here at
+                    // the one place that actually serializes with System.Text.Json instead. The frontend's
+                    // IUserTrackData interface never reads an id off this broadcast anyway.
+                    var json = JsonSerializer.Serialize(new
+                    {
+                        data.Path,
+                        data.TimesPlayed,
+                        data.IsFavourite,
+                        data.UpdatedAtUtc
+                    }, JsonSerializationHelper.SerializerOptions);
 
                     await libraryHub.Clients.All.SendAsync("ReceiveTrackUserData", json);
                     await playerHub.Clients.All.SendAsync("ReceiveTrackUserData", json);

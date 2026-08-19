@@ -2,6 +2,7 @@ using Microsoft.AspNetCore.SignalR;
 using MusicPlayer.Player;
 using MusicServer.Helpers;
 using MusicServer.Hubs;
+using System.Linq;
 using System.Text.Json;
 
 namespace MusicServer.Startup
@@ -19,6 +20,41 @@ namespace MusicServer.Startup
         private static IHubContext<PlayerHub> _playerHub;
         private static ILogger _logger;
         private static CancellationTokenSource _cts;
+
+        // Path of whichever track this loop last reported as playing - lets RunAsync notice a track change
+        // itself, entirely within its own single-threaded loop, with no second sender involved. An earlier
+        // version of this fix raised a separate Player.CurrentTrackChanged event and had its own independent
+        // SendAsync call race against this loop's own tick - both could be in flight around the same moment
+        // (most likely exactly when playback starts, since a new tick loop and the first "track changed" both
+        // fire together), and whichever one's SendAsync happened to land last on the client overwrote the other -
+        // including a trimmed, image-less tick landing after the real image, permanently hiding the art until
+        // the next track change. Doing the comparison here instead, with one send per tick, makes that
+        // impossible: there's only ever one message in flight for a given tick, in a fixed order. See
+        // KNOWN_ISSUES.md #19.
+        private static string? _lastSentPlayingTrackPath;
+
+        // Trimmed projection of PlaylistTrack sent on every 500ms tick - EqualizerPreset is dropped entirely
+        // (the frontend never reads it off this payload; the equalizer UI fetches presets through its own
+        // dedicated hub calls). Image is dropped for every track EXCEPT the currently-playing one, and even then
+        // only included on the tick where it just started playing (see RunAsync) - every other tick sends it as
+        // null, since the frontend already has it and just needs to hold onto what it was last given. Was
+        // previously re-serializing every track's full cover art and EQ object up to ~4x/second regardless of
+        // whether anything changed - see KNOWN_ISSUES.md #19.
+        private sealed class PlaybackTickTrack
+        {
+            public string Album { get; set; } = string.Empty;
+            public string Name { get; set; } = string.Empty;
+            public string Artist { get; set; } = string.Empty;
+            public double PlayedDuration { get; set; }
+            public double TotalDuration { get; set; }
+            public bool IsPlaying { get; set; }
+            public bool IsFavourite { get; set; }
+            public string Path { get; set; } = string.Empty;
+            // Deliberately nullable, no default - null (not empty string) means "no change this tick, client
+            // should keep whatever it already has" (see the frontend's own carry-forward logic in
+            // player.component.ts). Only ever populated for the playing track on the tick it changed.
+            public string? Image { get; set; }
+        }
 
         public static void Initialize(WebApplication app)
         {
@@ -61,7 +97,31 @@ namespace MusicServer.Startup
 
                     if (playbackInfo == null) return;
 
-                    var playbackInfoJson = JsonSerializer.Serialize(playbackInfo, JsonSerializationHelper.SerializerOptions);
+                    var playingPath = playbackInfo.Tracks?.FirstOrDefault(track => track.IsPlaying)?.Path;
+                    var trackJustChanged = !string.Equals(playingPath, _lastSentPlayingTrackPath);
+                    _lastSentPlayingTrackPath = playingPath;
+
+                    // Deliberately re-shaped into PlaybackTickTrack rather than serializing playbackInfo.Tracks
+                    // directly - see that class's doc comment for why Image/EqualizerPreset are dropped here.
+                    var tickPayload = new
+                    {
+                        playbackInfo.PlayerState,
+                        playbackInfo.HasReachedEndOfPlaylist,
+                        Tracks = playbackInfo.Tracks?.Select(track => new PlaybackTickTrack
+                        {
+                            Album = track.Album,
+                            Name = track.Name,
+                            Artist = track.Artist,
+                            PlayedDuration = track.PlayedDuration,
+                            TotalDuration = track.TotalDuration,
+                            IsPlaying = track.IsPlaying,
+                            IsFavourite = track.IsFavourite,
+                            Path = track.Path,
+                            Image = trackJustChanged && track.IsPlaying ? track.Image : null
+                        }).ToList()
+                    };
+
+                    var playbackInfoJson = JsonSerializer.Serialize(tickPayload, JsonSerializationHelper.SerializerOptions);
                     await _playerHub.Clients.All.SendAsync("ReceivePlaybackInformation", playbackInfoJson, token);
                 }
             }

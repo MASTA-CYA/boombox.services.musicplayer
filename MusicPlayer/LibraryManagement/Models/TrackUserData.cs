@@ -13,16 +13,17 @@ namespace MusicPlayer.LibraryManagement.Models
     // Id/UpdatedAtUtc are new but additive, so existing broadcast consumers just ignore them.
     public class TrackUserData
     {
-        // Also needs System.Text.Json's own JsonIgnore (fully qualified - a `using System.Text.Json.Serialization;`
-        // would collide with Newtonsoft.Json's JsonConverter/JsonIgnore attribute names already used unqualified
-        // in this file). This model pulls double duty as both the Mongo-backed document AND the plain-event
-        // broadcast payload (TrackUserDataChanged -> TrackUserDataBroadcast.cs), and that broadcast path
-        // serializes with System.Text.Json (MusicServer.Helpers.JsonSerializationHelper.SerializerOptions),
-        // which has no converter registered for MongoDB's ObjectId and throws trying to serialize one. The
-        // frontend's IUserTrackData interface never reads an id field from that broadcast anyway, so omitting
-        // it there costs nothing - Newtonsoft's ObjectIdConverter still applies everywhere Id actually needs to
-        // round-trip (Mongo, the AppData file cache).
-        [BsonId][JsonConverter(typeof(ObjectIdConverter))][System.Text.Json.Serialization.JsonIgnore] public ObjectId Id { get; set; }
+        // This model pulls double duty as both the Mongo-backed document AND the plain-event broadcast payload
+        // (TrackUserDataChanged -> TrackUserDataBroadcast.cs), and that broadcast path serializes with
+        // System.Text.Json (MusicServer.Helpers.JsonSerializationHelper.SerializerOptions), which has no
+        // converter registered for MongoDB's ObjectId and throws trying to serialize one. A System.Text.Json
+        // [JsonIgnore] on Id would fix that, but this project (MusicPlayer, old-style .NET Framework 4.8 csproj)
+        // has no reference to System.Text.Json at all - fully qualifying the attribute doesn't avoid needing the
+        // assembly, it still failed to compile (CS0234) the first time this was tried. Fixed instead at the
+        // broadcast call site: TrackUserDataBroadcast.cs serializes a trimmed anonymous projection that never
+        // includes Id, so System.Text.Json never sees the ObjectId. Newtonsoft's ObjectIdConverter below still
+        // applies everywhere Id actually needs to round-trip (Mongo, the AppData file cache).
+        [BsonId][JsonConverter(typeof(ObjectIdConverter))] public ObjectId Id { get; set; }
         public string Path { get; set; }
         public int TimesPlayed { get; set; }
         public bool IsFavourite { get; set; }
