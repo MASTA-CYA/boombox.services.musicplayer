@@ -54,6 +54,20 @@ namespace MusicPlayer.FileManagement
 
         public string Read(string path) => File.ReadAllText(path);
 
+        // Dedicated pair for the trackUserData disaster-recovery backup (see MongoDbClient.BackupTrackUserDataAsync
+        // and LibraryManager.MigrateTrackUserDataIfNeededAsync) - a fixed, single well-known file rather than the
+        // generic Write(path, content)/Read(path) pair above, so callers never have to know or reconstruct the
+        // AppData directory path themselves. Read returns null instead of throwing when the file doesn't exist yet
+        // (e.g. genuinely first-ever run, before any backup has been written) - callers treat "no backup" as a
+        // normal, expected case, not an error.
+        public void WriteTrackUserDataBackup(string json) => File.WriteAllText(Path.Combine(_appDataDirectory, Constants.TRACK_USER_DATA_BACKUP_FILE), json);
+
+        public string ReadTrackUserDataBackup()
+        {
+            var path = Path.Combine(_appDataDirectory, Constants.TRACK_USER_DATA_BACKUP_FILE);
+            return File.Exists(path) ? File.ReadAllText(path) : null;
+        }
+
         public List<string> GetFilePaths(string pattern) => Directory.EnumerateFiles(_appDataDirectory, pattern, SearchOption.TopDirectoryOnly).ToList();
 
         public List<string> GetFilePaths(string pattern, string regexPattern)

@@ -161,6 +161,25 @@ namespace MusicPlayer.LibraryManagement
                 var alreadyMigrated = (await MongoDbClient.Instance.GetAllTrackUserDataAsync()).Any();
                 if (alreadyMigrated) return;
 
+                // Prefer the disaster-recovery backup file (MongoDbClient.BackupTrackUserDataAsync) over
+                // reconstructing from Mongo's albums/playlists collections below - a full Mongo clear wipes those
+                // too, so they can't help recover from exactly the scenario this backup exists for. The backup is
+                // also strictly fresher/more complete: it's written on every real favourite/times-played change,
+                // while albums/playlists only ever reflect whatever was true at the last mapping run for that
+                // album. Only falls through to the original reconstruction below if no backup file exists yet -
+                // e.g. a genuinely first-ever run, before this collection or its backup ever existed.
+                var backupJson = FileManager.Instance.ReadTrackUserDataBackup();
+                if (!string.IsNullOrWhiteSpace(backupJson))
+                {
+                    var backedUp = JsonConvert.DeserializeObject<List<TrackUserData>>(backupJson, JsonSerializationHelper.FileSerializerSettings);
+                    if (backedUp != null && backedUp.Any())
+                    {
+                        await MongoDbClient.Instance.InsertTrackUserDataBatchAsync(backedUp);
+                        _logger.LogWarning("Restored {Count} track user data records from local backup file", backedUp.Count);
+                        return;
+                    }
+                }
+
                 var albums = await MongoDbClient.Instance.GetAlbumsAsync();
                 var favouritePlaylist = await MongoDbClient.Instance.GetPlaylistAsync("Favourite");
                 var favouritePaths = new HashSet<string>(
@@ -314,6 +333,35 @@ namespace MusicPlayer.LibraryManagement
             SelectedAlbum = JsonConvert.SerializeObject(mappedAlbum, JsonSerializationHelper.NamingSerializerSettings);
             _ = Task.Run(async () => await UpsertMappedAlbumsAsync(new ConcurrentBag<Album> { mappedAlbum }));
             _ = Task.Run(() => FileManager.Instance.Write(mappedAlbum));
+            // Self-heal for the "duplicate card" bug (see KNOWN_ISSUES.md): a refresh that ran before the Guid
+            // carry-forward fix above would have left an orphaned cache file behind under a stale Guid. Cheap
+            // enough to run on every refresh regardless — normally finds nothing, since mappedAlbum.Guid now
+            // matches the existing file.
+            _ = Task.Run(() => RemoveOrphanedAlbumCacheFiles(path, mappedAlbum.Guid));
+        }
+
+        // Deletes any other cached album JSON file whose stored Path matches this album but whose filename
+        // (the album's Guid) doesn't match the one we just wrote — a leftover from before a bug fix, or any
+        // future path where a refresh generates a new Guid instead of reusing the existing one.
+        private void RemoveOrphanedAlbumCacheFiles(string albumPath, Guid keepGuid)
+        {
+            try
+            {
+                var cachedFilePaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
+                foreach (var file in cachedFilePaths)
+                {
+                    var fileGuid = Path.GetFileNameWithoutExtension(file);
+                    if (string.Equals(fileGuid, keepGuid.ToString(), StringComparison.OrdinalIgnoreCase)) continue;
+
+                    var cachedPath = ReadCachedAlbumPath(file);
+                    if (string.Equals(cachedPath, albumPath))
+                        FileManager.Instance.RemoveFile(file);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unable to clean up orphaned album cache files for {Path}", albumPath);
+            }
         }
 
         #region Equalizer Assignments
@@ -617,6 +665,12 @@ namespace MusicPlayer.LibraryManagement
             }
 
             album.Id = savedAlbum?.Id ?? ObjectId.GenerateNewId();
+            // Carries the existing album's Guid forward, same as RefreshMappedAlbum's generic branch does for
+            // every other album — Album.Guid defaults to a fresh random value on every `new Album { ... }`, and
+            // the per-album AppData cache file is named `{Guid}.json`, so without this a Singles refresh would
+            // silently write a brand-new cache file instead of overwriting the existing one, leaving the old one
+            // behind as an orphan (this was the cause of the "duplicate Singles card" bug — see KNOWN_ISSUES.md).
+            album.Guid = savedAlbum?.Guid ?? Guid.NewGuid();
             album.NumberOfTracks = tracks.Count;
             album.Duration = tracks.Sum(track => track.Duration);
             album.Tracks = tracks.OrderBy(track => track.TrackNumber).ToList();

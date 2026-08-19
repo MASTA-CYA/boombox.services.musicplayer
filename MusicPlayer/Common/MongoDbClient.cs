@@ -1,9 +1,13 @@
-﻿using MongoDB.Bson;
+﻿using Microsoft.Extensions.Logging;
+using MongoDB.Bson;
 using MongoDB.Driver;
+using MusicPlayer.FileManagement;
+using MusicPlayer.Helpers;
 using MusicPlayer.LibraryManagement.Models;
 using MusicPlayer.LyricsManagement.Models;
 using MusicPlayer.Player.Models;
 using MusicPlayer.PlaylistManagement.Models;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -13,6 +17,8 @@ namespace MusicPlayer.Common
 {
     public class MongoDbClient
     {
+        private static readonly ILogger _logger = AppLogger.CreateLogger<MongoDbClient>();
+
         private const string URI = "mongodb://10.0.0.254:27017/?directConnection=true";
         private readonly IMongoClient _client;
         private readonly IMongoDatabase _database;
@@ -237,6 +243,7 @@ namespace MusicPlayer.Common
                 .SetOnInsert(data => data.Path, path);
 
             await _trackUserDataCollection.UpdateOneAsync(filter, update, new UpdateOptions { IsUpsert = true });
+            _ = BackupTrackUserDataAsync();
             return isFavourite;
         }
 
@@ -261,6 +268,10 @@ namespace MusicPlayer.Common
             if (records.Count == 0) return;
 
             await _trackUserDataCollection.InsertManyAsync(records);
+            // Seeds the backup file immediately after a fresh migration, rather than waiting for the first
+            // subsequent toggle/play - closes the gap where a second Mongo clear landing right after a migration
+            // (before any real user write happens) would otherwise have nothing to recover from yet.
+            _ = BackupTrackUserDataAsync();
         }
 
         public async Task<int> IncrementTimesPlayedAsync(string path)
@@ -274,7 +285,33 @@ namespace MusicPlayer.Common
 
             var options = new FindOneAndUpdateOptions<TrackUserData> { IsUpsert = true, ReturnDocument = ReturnDocument.After };
             var updated = await _trackUserDataCollection.FindOneAndUpdateAsync(filter, update, options);
+            _ = BackupTrackUserDataAsync();
             return updated.TimesPlayed;
+        }
+
+        // Disaster-recovery backup for the "Mongo clear wipes favourites/times-played permanently" gap -
+        // trackUserData is now the ONLY store for this data (that's what fixed the old three-way desync bug), so
+        // without this, a full Mongo clear loses it with nothing to reconstruct from. Deliberately never read
+        // from during normal operation - only LibraryManager.MigrateTrackUserDataIfNeededAsync consults it, and
+        // only when the trackUserData collection is found empty at startup. Fire-and-forget from every call site
+        // above and fails silently (logged, not thrown) so a backup-write problem can never break the actual
+        // Mongo write that triggered it - this is a safety net, not something playback correctness depends on.
+        // Writes the FULL current collection on every call rather than an incremental diff - a full collection
+        // scan plus a full file rewrite per toggle/play is trivially cheap at this app's real scale (a personal
+        // library, ~6,400 tracks as of the last migration) and guarantees correctness with no cache-sync risk,
+        // which matters more here than shaving a few milliseconds off a background write.
+        private async Task BackupTrackUserDataAsync()
+        {
+            try
+            {
+                var all = await GetAllTrackUserDataAsync();
+                var json = JsonConvert.SerializeObject(all, JsonSerializationHelper.FileSerializerSettings);
+                FileManager.Instance.WriteTrackUserDataBackup(json);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unable to write trackUserData backup file");
+            }
         }
 
         #endregion Track User Data

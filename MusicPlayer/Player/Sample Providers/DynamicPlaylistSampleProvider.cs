@@ -10,6 +10,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace MusicPlayer.Player
@@ -127,14 +129,40 @@ namespace MusicPlayer.Player
         {
             if (!string.IsNullOrWhiteSpace(serverFileName))
             {
+                _logger.LogInformation("Reusing cached resample for {OriginalPath}: {ServerFileName}", config.Key, serverFileName);
                 reSampledProviders.Add(new EnhancedAudioFileReader(serverFileName: serverFileName, originalFileName: config.Key, equalizerPreset: config.Value));
                 return;
             }
 
             using (var reader = new AudioFileReader(config.Key))
             {
+                // Diagnostic for the "some tracks play at ~2x speed" report (KNOWN_ISSUES.md #22) - reproduces
+                // even as the only track in the queue, which rules out the cache-collision fix already shipped
+                // for that item. Logging exactly what NAudio's AudioFileReader believes the SOURCE file's format
+                // is (before any resampling) is the most direct way to see whether it's misdetecting an unusual
+                // sample rate (e.g. hi-res 88.2/96kHz FLAC) rather than something in the resample/cache step.
+                _logger.LogInformation(
+                    "Resampling {OriginalPath}: source {SourceSampleRate}Hz/{SourceChannels}ch/{SourceBitsPerSample}bit ({SourceEncoding}) -> target {TargetSampleRate}Hz",
+                    config.Key, reader.WaveFormat.SampleRate, reader.WaveFormat.Channels, reader.WaveFormat.BitsPerSample, reader.WaveFormat.Encoding, SAMPLE_RATE);
+
                 var resampler = new WdlResamplingSampleProvider(reader, SAMPLE_RATE);
-                var resampledFilename = Path.Combine(new string[] { Constants.RESAMPLED_PROVIDERS_DIRECTORY, $"{Path.GetFileNameWithoutExtension(config.Key)}.wav" });
+
+                // WdlResamplingSampleProvider only changes sample rate - it keeps the source's channel count
+                // as-is (confirmed via the diagnostic log above: BATTERY.mp3 reads as 1ch). Every cached WAV
+                // previously stayed mono for a mono source, but DynamicPlaylistSampleProvider.WaveFormat (below,
+                // in the constructor) is hardcoded to 2 channels, and Read() treats the underlying stream as
+                // interleaved stereo regardless. Reading a mono stream through a stereo-shaped pipeline packs two
+                // separate mono samples (two distinct instants in time) into what everything downstream treats as
+                // one stereo frame (one instant, left+right) - the audio timeline advances twice as fast for the
+                // same sample-consumption rate, which is exactly "2x speed" (KNOWN_ISSUES.md #22). Upmixing here,
+                // once, at cache-write time, means the cached file itself is always properly stereo, so nothing
+                // downstream (including a cache-hit read of this same file later) ever has to know the source was
+                // mono to begin with.
+                ISampleProvider outputProvider = resampler;
+                if (resampler.WaveFormat.Channels == 1)
+                    outputProvider = new MonoToStereoSampleProvider(resampler);
+
+                var resampledFilename = Path.Combine(new string[] { Constants.RESAMPLED_PROVIDERS_DIRECTORY, GetCacheFileName(config.Key) });
 
                 // Was CreateWaveFile16, which truncates every track to 16-bit PCM with no dithering regardless of
                 // source resolution — any 24-bit FLAC lost real resolution before it ever reached the Focusrite/
@@ -142,18 +170,31 @@ namespace MusicPlayer.Player
                 // full precision; only the sample rate is intentionally changed here, not bit depth. Safe to swap
                 // with no migration step: Program.cs clears RESAMPLED_PROVIDERS_DIRECTORY on every startup, so the
                 // cache regenerates in the new format automatically on next run.
-                WaveFileWriter.CreateWaveFile(resampledFilename, resampler.ToWaveProvider());
+                WaveFileWriter.CreateWaveFile(resampledFilename, outputProvider.ToWaveProvider());
                 reSampledProviders.Add(new EnhancedAudioFileReader(serverFileName: resampledFilename, originalFileName: config.Key, equalizerPreset: config.Value));
             }
         }
 
-        private bool HasMatchingServerFileName(string serverPath, string originalPath)
+        // Cache filename now includes a short hash of the FULL original path, not just its base filename.
+        // Previously two entirely different tracks that happened to share a base filename (common in a large
+        // library - generic rip names like "01 Intro.flac", or the same interlude/bonus-track name reused across
+        // albums) collided both on disk (the second track's resample silently overwrote/reused the first's
+        // cached .wav) and in HasMatchingServerFileName's lookup below - the wrong track's cached audio would get
+        // attached to a different track's queue slot, playing back as a mismatched or effectively "wrong speed"
+        // track. Hashing the full path makes the generated filename unique per source file regardless of how
+        // many tracks share the same name.
+        private static string GetCacheFileName(string originalPath)
         {
-            var serverFileName = Path.GetFileNameWithoutExtension(serverPath);
-            var originalFileName = Path.GetFileNameWithoutExtension(originalPath);
-
-            return string.Equals(serverFileName, originalFileName);
+            using (var sha256 = SHA256.Create())
+            {
+                var hashBytes = sha256.ComputeHash(Encoding.UTF8.GetBytes(originalPath));
+                var hash = BitConverter.ToString(hashBytes).Replace("-", "").Substring(0, 16);
+                return $"{Path.GetFileNameWithoutExtension(originalPath)}_{hash}.wav";
+            }
         }
+
+        private bool HasMatchingServerFileName(string serverPath, string originalPath)
+            => string.Equals(Path.GetFileName(serverPath), GetCacheFileName(originalPath), StringComparison.OrdinalIgnoreCase);
 
         public void PlayNextProvider()
         {
@@ -194,12 +235,35 @@ namespace MusicPlayer.Player
 
                 if (string.IsNullOrWhiteSpace(indexPath))
                 {
-                    var lastAppendingQueuedProvider = queue.Find(provider => provider.CanAppend
-                        && string.Equals(provider.IndexPath, (_providers.Last() as EnhancedAudioFileReader).OriginalFilePath));
-                    var currentProviders = lastAppendingQueuedProvider.Providers.ToList();
-                    currentProviders.AddRange(GetResampledProviders(configs));
-                    lastAppendingQueuedProvider.Providers = currentProviders;
+                    // Looking for an existing pending instruction that is ITSELF anchored at the true end of the
+                    // queue (CanAppend, and its own IndexPath is null/whitespace - that's what "append to end"
+                    // means for a QueuedProviderInstruction). This used to compare against
+                    // (_providers.Last() as EnhancedAudioFileReader).OriginalFilePath instead - a real file path -
+                    // which an append-to-end instruction's IndexPath (always null) can never equal, so Find always
+                    // returned null the moment a second "add to end of queue" call landed while a first one was
+                    // still pending (i.e. before the next track boundary merged it into _providers via
+                    // AddQueuedProviders). The null result then NullReferenceException'd on .Providers below,
+                    // silently caught by the catch block, so the second add appeared to just do nothing - visible
+                    // as "refuses to add tracks" (e.g. adding more Singles tracks shortly after adding some). Also
+                    // made null-safe: if genuinely nothing is pending yet, fall through to starting a new
+                    // instruction instead of crashing.
+                    var lastAppendingQueuedProvider = queue.Find(provider => provider.CanAppend && string.IsNullOrWhiteSpace(provider.IndexPath));
 
+                    if (lastAppendingQueuedProvider != null)
+                    {
+                        var currentProviders = lastAppendingQueuedProvider.Providers.ToList();
+                        currentProviders.AddRange(GetResampledProviders(configs));
+                        lastAppendingQueuedProvider.Providers = currentProviders;
+                        return;
+                    }
+
+                    queue.Add(new QueuedProviderInstruction
+                    {
+                        Providers = GetResampledProviders(configs),
+                        CanAppend = canAppend,
+                        IndexPath = indexPath,
+                    });
+                    _queuedProviders = queue;
                     return;
                 }
 
