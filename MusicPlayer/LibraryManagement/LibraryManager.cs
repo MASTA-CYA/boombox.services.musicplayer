@@ -61,7 +61,9 @@ namespace MusicPlayer.LibraryManagement
             // favourited and now (Windows filesystems are case-insensitive but case-preserving) can't cause a
             // lookup miss - see BuildUserDataLookup and the track-user-data design notes.
             var userDataLookup = BuildUserDataLookup(await MongoDbClient.Instance.GetAllTrackUserDataAsync());
-            var mappedAlbums = await Task.Run(() => GetAlbums(databaseAlbums, userDataLookup));
+            // Same bulk-fetch-once treatment for equalizer presets - see BuildEqualizerPresetLookup.
+            var presetLookup = BuildEqualizerPresetLookup(await MongoDbClient.Instance.GetAllEqualizerPresetsAsync());
+            var mappedAlbums = await Task.Run(() => GetAlbums(databaseAlbums, userDataLookup, presetLookup));
             _ = Task.Run(async () => await UpsertMappedAlbumsAsync(mappedAlbums));
             return mappedAlbums.ToList();
         }
@@ -82,9 +84,16 @@ namespace MusicPlayer.LibraryManagement
             }
 
             var mediaInfo = new MediaInfoWrapper(filePath);
-            var userData = Task.Run(async () => await MongoDbClient.Instance.GetTrackUserDataAsync(filePath)).GetAwaiter().GetResult();
+
+            // Was Task.Run(async () => await Foo()).GetAwaiter().GetResult() - same redundant-thread-hop
+            // antipattern already fixed on the mapping path (KNOWN_ISSUES.md #5): scheduling the async lambda
+            // onto the thread pool via Task.Run, then immediately blocking that thread-pool thread on its own
+            // result, burns two thread-pool threads per call instead of one. Calling the async method directly
+            // and blocking on it here has the same synchronous behavior (this method's own signature isn't
+            // async, and its Select(...)-based callers need it to stay that way) without the extra hop.
+            var userData = MongoDbClient.Instance.GetTrackUserDataAsync(filePath).GetAwaiter().GetResult();
             var isFavourite = userData?.IsFavourite ?? false;
-            var preset = Task.Run(async () => await MongoDbClient.Instance.GetEqualizerPresetAsync(filePath)).GetAwaiter().GetResult();
+            var preset = MongoDbClient.Instance.GetEqualizerPresetAsync(filePath).GetAwaiter().GetResult();
 
             return new PlaylistTrack
             {
@@ -314,8 +323,9 @@ namespace MusicPlayer.LibraryManagement
         {
             var databaseAlbum = await GetCachedDatabaseAlbumAsync(path);
             var userDataLookup = BuildUserDataLookup(await MongoDbClient.Instance.GetAllTrackUserDataAsync());
+            var presetLookup = BuildEqualizerPresetLookup(await MongoDbClient.Instance.GetAllEqualizerPresetsAsync());
 
-            var mappedAlbum = RefreshMappedAlbum(path, databaseAlbum, userDataLookup);
+            var mappedAlbum = RefreshMappedAlbum(path, databaseAlbum, userDataLookup, presetLookup);
 
             // RefreshMappedAlbum returns null for a handful of legitimate reasons (excluded directory, no audio
             // files left, unreadable tags leaving Name/Artist unresolved) - previously this fell straight
@@ -463,7 +473,7 @@ namespace MusicPlayer.LibraryManagement
 
         #region Private Functions
 
-        private ConcurrentBag<Album> GetAlbums(List<Album> databaseAlbums, Dictionary<string, TrackUserData> userDataLookup)
+        private ConcurrentBag<Album> GetAlbums(List<Album> databaseAlbums, Dictionary<string, TrackUserData> userDataLookup, Dictionary<string, Guid> presetLookup)
         {
             // Reset from any previous run so a stale IsComplete/Error doesn't linger into this one — MusicServer's
             // MappingUpdateBroadcast treats IsComplete transitioning to true as "this run just finished, persist
@@ -529,7 +539,7 @@ namespace MusicPlayer.LibraryManagement
                         if (string.Equals(directoryName, "Singles"))
                         {
                             var savedSinglesAlbum = databaseAlbums?.Find(dbAlbum => string.Equals(dbAlbum.Path, directory));
-                            var singlesAlbum = MapSinglesAlbum(directory, savedSinglesAlbum, userDataLookup, directoryInfo);
+                            var singlesAlbum = MapSinglesAlbum(directory, savedSinglesAlbum, userDataLookup, presetLookup, directoryInfo);
                             albums.Add(singlesAlbum);
                             continue;
                         }
@@ -563,10 +573,10 @@ namespace MusicPlayer.LibraryManagement
                             {
                                 var mediaInfo = new MediaInfoWrapper(file);
                                 var savedtrack = savedAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
-                                // Awaited directly instead of via Task.Run(...).GetAwaiter().GetResult() — the old code
-                                // queued a second thread-pool thread just to block-wait on it, doubling the thread cost
-                                // of every Mongo lookup on top of the Parallel.ForEach worker already blocked here.
-                                var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
+                                // Was GetTrackEqualizerPresetGuidAsync(...).GetAwaiter().GetResult() - one Mongo
+                                // round trip per file across the whole library (KNOWN_ISSUES.md #5's N+1 note).
+                                // Now a synchronous lookup against presetLookup, fetched once for the whole scan.
+                                var presetGuid = ResolveEqualizerPresetGuid(file, savedtrack?.EqualizerGuid ?? Guid.Empty, presetLookup);
                                 userDataLookup.TryGetValue(file, out var userData);
                                 tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, presetGuid, userData));
                             }
@@ -616,7 +626,7 @@ namespace MusicPlayer.LibraryManagement
                 }
         }
 
-        private Album MapSinglesAlbum(string directory, Album savedAlbum, Dictionary<string, TrackUserData> userDataLookup, DirectoryInfo directoryInfo)
+        private Album MapSinglesAlbum(string directory, Album savedAlbum, Dictionary<string, TrackUserData> userDataLookup, Dictionary<string, Guid> presetLookup, DirectoryInfo directoryInfo)
         {
             var files = Directory.EnumerateFiles(directory, "*.*", SearchOption.AllDirectories).ToList();
 
@@ -647,7 +657,7 @@ namespace MusicPlayer.LibraryManagement
                 {
                     var mediaInfo = new MediaInfoWrapper(file);
                     var savedtrack = savedAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
-                    var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
+                    var presetGuid = ResolveEqualizerPresetGuid(file, savedtrack?.EqualizerGuid ?? Guid.Empty, presetLookup);
                     userDataLookup.TryGetValue(file, out var userData);
                     tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, presetGuid, userData));
                 }
@@ -701,6 +711,8 @@ namespace MusicPlayer.LibraryManagement
             // Fetched once here instead of once per file — the old code queried the Favourite playlist from Mongo
             // on every single track.
             var userDataLookup = BuildUserDataLookup(await MongoDbClient.Instance.GetAllTrackUserDataAsync());
+            // Same batching for equalizer presets - see BuildEqualizerPresetLookup.
+            var presetLookup = BuildEqualizerPresetLookup(await MongoDbClient.Instance.GetAllEqualizerPresetsAsync());
 
             Parallel.ForEach(files, new ParallelOptions { MaxDegreeOfParallelism = Environment.ProcessorCount }, file =>
             {
@@ -709,7 +721,7 @@ namespace MusicPlayer.LibraryManagement
                 try
                 {
                     var mediaInfo = new MediaInfoWrapper(file);
-                    var presetGuid = GetTrackEqualizerPresetGuidAsync(file, Guid.Empty).GetAwaiter().GetResult();
+                    var presetGuid = ResolveEqualizerPresetGuid(file, Guid.Empty, presetLookup);
                     userDataLookup.TryGetValue(file, out var userData);
                     tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, presetGuid, userData));
                 }
@@ -740,7 +752,7 @@ namespace MusicPlayer.LibraryManagement
             return album;
         }
 
-        private Album RefreshMappedAlbum(string path, Album databaseAlbum, Dictionary<string, TrackUserData> userDataLookup)
+        private Album RefreshMappedAlbum(string path, Album databaseAlbum, Dictionary<string, TrackUserData> userDataLookup, Dictionary<string, Guid> presetLookup)
         {
             // Checked before doing any file enumeration — the old code always walked the whole directory tree and
             // scanned for images first, even for the "Singles" and excluded-directory cases where that work is
@@ -758,7 +770,7 @@ namespace MusicPlayer.LibraryManagement
             var directoryInfo = new DirectoryInfo(path);
 
             if (string.Equals(directoryInfo.Name, "Singles"))
-                return MapSinglesAlbum(path, databaseAlbum, userDataLookup, directoryInfo);
+                return MapSinglesAlbum(path, databaseAlbum, userDataLookup, presetLookup, directoryInfo);
 
             var directoryName = directoryInfo.Name;
             if (_directoryExclusions.Contains(directoryName)) return null;
@@ -784,7 +796,7 @@ namespace MusicPlayer.LibraryManagement
                 {
                     var mediaInfo = new MediaInfoWrapper(file);
                     var savedtrack = databaseAlbum?.Tracks.Find(track => string.Equals(track.Path, file));
-                    var presetGuid = GetTrackEqualizerPresetGuidAsync(file, savedtrack?.EqualizerGuid ?? Guid.Empty).GetAwaiter().GetResult();
+                    var presetGuid = ResolveEqualizerPresetGuid(file, savedtrack?.EqualizerGuid ?? Guid.Empty, presetLookup);
                     userDataLookup.TryGetValue(file, out var userData);
                     tracks.Add(MapAlbumTrackMetaData(mediaInfo, album.Artist, file, presetGuid, userData));
                 }
@@ -899,6 +911,60 @@ namespace MusicPlayer.LibraryManagement
                 .GroupBy(data => data.Path, StringComparer.OrdinalIgnoreCase)
                 .ToDictionary(group => group.Key, group => group.First(), StringComparer.OrdinalIgnoreCase);
 
+        // Same batching fix as BuildUserDataLookup, for the same reason - KNOWN_ISSUES.md #5's "N+1 Mongo query
+        // in GetTrackEqualizerPresetGuidAsync (one round trip per file) - not batched". Named presets and
+        // per-track custom overrides (Name == track path) share one collection, keyed by Name the same way
+        // GetEqualizerPresetAsync(name) already matches (plain ordinal, not case-insensitive - unlike
+        // trackUserData, this hasn't had a reported path-casing issue, so kept as-is rather than changing
+        // behavior beyond the batching itself). GroupBy+First for the same reason as above: never crash a
+        // library load over a stray duplicate Name.
+        private static Dictionary<string, Guid> BuildEqualizerPresetLookup(IEnumerable<EqualizerPreset> presets)
+            => presets
+                .GroupBy(preset => preset.Name)
+                .ToDictionary(group => group.Key, group => group.First().Guid);
+
+        // Replaces the old GetTrackEqualizerPresetGuidAsync's one-Mongo-call-per-file lookup with a synchronous
+        // read against a lookup built once per mapping pass (see BuildEqualizerPresetLookup). Same short-circuit
+        // as before: a track that already has an assigned EqualizerGuid keeps it, no lookup needed.
+        private static Guid ResolveEqualizerPresetGuid(string path, Guid existingGuid, Dictionary<string, Guid> presetLookup)
+        {
+            if (existingGuid != Guid.Empty) return existingGuid;
+            return presetLookup.TryGetValue(path, out var guid) ? guid : Guid.Empty;
+        }
+
+        // Overlays LIVE trackUserData onto already-mapped albums' tracks - needed by any read path that serves a
+        // previously-cached Album without running a full mapping pass. GetAlbumsAsync/RefreshAlbumAsync already
+        // pull trackUserData fresh via BuildUserDataLookup because they run an actual mapping pass, but two real
+        // read paths don't: LibraryHub's fast "Cache" library load (deserializes every per-album JSON file
+        // straight off disk) and GetSelectedAlbumAsync (deserializes a single album's JSON file the same way).
+        // Both of those JSON files only ever get their IsFavourite/TimesPlayed fields refreshed when that
+        // specific album is next mapped/refreshed - toggling a favourite anywhere else (the player, a different
+        // album's grid) only updates trackUserData plus whatever PlaylistTrack happens to be live in memory (see
+        // UpdateIsFavoriteTrackAsync), never these on-disk snapshots. That's exactly what let the player show a
+        // track as favourited while the album grid - served straight from its stale JSON cache - still showed it
+        // as not. Calling this right before either of those cache reads returns to the client makes trackUserData
+        // the actual single source of truth end-to-end, not just for the mapping passes.
+        public async Task ApplyLiveTrackUserDataAsync(IEnumerable<Album> albums)
+        {
+            var userDataLookup = BuildUserDataLookup(await MongoDbClient.Instance.GetAllTrackUserDataAsync());
+
+            foreach (var album in albums)
+            {
+                if (album?.Tracks == null) continue;
+
+                foreach (var track in album.Tracks)
+                {
+                    if (string.IsNullOrWhiteSpace(track.Path)) continue;
+                    if (!userDataLookup.TryGetValue(track.Path, out var userData)) continue;
+
+                    track.IsFavourite = userData.IsFavourite;
+                    track.TimesPlayed = userData.TimesPlayed;
+                }
+            }
+        }
+
+        public async Task ApplyLiveTrackUserDataAsync(Album album) => await ApplyLiveTrackUserDataAsync(new[] { album });
+
         private int GetDiscNumber(string path)
         {
             var extData = MediaFile.Read(path);
@@ -997,21 +1063,6 @@ namespace MusicPlayer.LibraryManagement
             }
         }
 
-        private async Task<Guid> GetTrackEqualizerPresetGuidAsync(string path, Guid equalizerGuid)
-        {
-            if (equalizerGuid != Guid.Empty) return equalizerGuid;
-
-            try
-            {
-                return (await MongoDbClient.Instance.GetEqualizerPresetAsync(path))?.Guid ?? Guid.Empty;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Unable to get equalizer preset for {Path}", path);
-                MappingUpdate.Error = ex.Message;
-                return Guid.Empty;
-            }
-        }
 
         private List<string> GetUnmappedDirectories()
         {

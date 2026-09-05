@@ -94,6 +94,14 @@ namespace MusicPlayer.Common
 
         public async Task<EqualizerPreset> GetEqualizerPresetAsync(string name) => await _equalizerCollection.Find(preset => string.Equals(preset.Name, name)).FirstOrDefaultAsync();
 
+        // KNOWN_ISSUES.md #5's "N+1 Mongo query in GetTrackEqualizerPresetGuidAsync (one round trip per file) -
+        // not batched" - one query per track during a full library mapping pass. Same shape/fix as
+        // GetAllTrackUserDataAsync: fetch the whole (small) collection once and let the caller build a local
+        // lookup, instead of one round trip per file. No filter, same as GetEqualizerPresetAsync(name)'s
+        // unfiltered match-by-Name - both named presets and per-track custom overrides (Name == track path) live
+        // in the same collection.
+        public async Task<List<EqualizerPreset>> GetAllEqualizerPresetsAsync() => await _equalizerCollection.Find(Builders<EqualizerPreset>.Filter.Empty).ToListAsync();
+
         public async Task InsertEqualizerPresetAsync(EqualizerPreset preset) => await _equalizerCollection.InsertOneAsync(preset);
 
         public async Task UpdateEqualizerPresetAsync(EqualizerPreset preset)

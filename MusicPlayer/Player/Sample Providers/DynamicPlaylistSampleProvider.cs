@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging;
 using MusicPlayer.Common;
 using MusicPlayer.Extensions;
 using MusicPlayer.FileManagement;
@@ -7,6 +7,7 @@ using NAudio.Dsp;
 using NAudio.Wave;
 using NAudio.Wave.SampleProviders;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -21,6 +22,15 @@ namespace MusicPlayer.Player
         private const int SAMPLE_RATE = 44100;
         private const float BAND_WIDTH_Q = 1.414f;
 
+        // How many tracks ahead of / behind the current one stay resampled to disk at any given time. Everything
+        // else in the queue exists only as a cheap "unsampled" reader (opens the original source file directly,
+        // just to know its duration - no resample, no disk write) until the rolling window reaches it. This is
+        // what actually caps disk usage for a long queue: resampling used to happen eagerly for the WHOLE queue
+        // the moment it was played/queued, regardless of how much of it you'd actually get to. See KNOWN_ISSUES.md
+        // for the full write-up (lazy resample window feature).
+        private const int LOOKAHEAD_WINDOW = 2;
+        private const int RETENTION_WINDOW = 1;
+
         private static readonly ILogger _logger = AppLogger.CreateLogger<DynamicPlaylistSampleProvider>();
 
         private PeekingEnumerator<ISampleProvider> _enumerator;
@@ -32,6 +42,30 @@ namespace MusicPlayer.Player
         private IEnumerable<ISampleProvider> _providers;
         public IEnumerable<ISampleProvider> Providers { get => GetProviders(); }
         private ISampleProvider _currentProvider;
+
+        // Background resample results waiting to be swapped into _providers at the next safe track boundary -
+        // same reasoning as _queuedProviders: Read() runs on the audio callback thread mid-track, so _providers
+        // can't be mutated from a background Task directly. Populated from Task.Run closures (any thread),
+        // drained only from EnsureWindowResampled (always the audio thread) - ConcurrentQueue is what makes that
+        // cross-thread handoff safe without an explicit lock.
+        private readonly ConcurrentQueue<EnhancedAudioFileReader> _resampledSwapsReady = new ConcurrentQueue<EnhancedAudioFileReader>();
+
+        // Tracks which original paths currently have a background resample in flight, so a track that's been in
+        // the lookahead window for two consecutive boundary checks doesn't get a second redundant resample task
+        // kicked off before the first one finishes. Added to from the audio thread (EnsureWindowResampled), but
+        // removed from both there AND from inside the Task.Run closure's catch block (a background thread) on
+        // failure - a plain HashSet isn't safe for that cross-thread mutation, hence ConcurrentDictionary used
+        // as a set (ignore the value, only the key matters).
+        private readonly ConcurrentDictionary<string, byte> _resamplingInFlight = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+
+        // Shuffle mode used to re-randomize the entire remaining queue on every single track-end. With lazy
+        // resampling that no longer works - only ~3-4 tracks ever have a live provider at once, so reshuffling
+        // just that tiny window wouldn't be a meaningful shuffle across a large playlist, and deciding "what's
+        // next" only at the exact moment the current track ends makes a resample-ahead impossible to fit in
+        // before it's needed. Instead the order is decided once, the first time shuffle mode is seen, and walked
+        // sequentially from then on through the same lazy window as every other mode. Reset to false whenever the
+        // mode isn't Shuffle (see HandleEndOfProviderReached), so re-entering shuffle later gets a fresh shuffle.
+        private bool _shuffleOrderEstablished;
 
         private readonly float[] _bandCenterFrequencies;
         private readonly BiQuadFilter[,] _equalizerFrequencyFilters;
@@ -55,7 +89,21 @@ namespace MusicPlayer.Player
 
         public DynamicPlaylistSampleProvider(Dictionary<string, EqualizerPreset> trackConfigurations, float[] frequencies)
         {
-            _providers = GetResampledProviders(trackConfigurations);
+            // Only the current track plus the next LOOKAHEAD_WINDOW get a real resample + disk cache write here -
+            // everything else in the queue is built as a cheap "unsampled" reader (opens the original source file
+            // directly, just for its duration - see GetUnsampledProviders) and gets upgraded later by
+            // EnsureWindowResampled as the rolling window reaches it. _providers still holds the FULL queue from
+            // the start, in order - Player.cs's polling (UpdatePlaybackInformation) depends on Providers.Count()
+            // matching the full display list and every track having a valid reader to read TotalTime/CurrentTime
+            // off, both of which an unsampled reader already satisfies.
+            var orderedConfigs = trackConfigurations.ToList();
+            var windowConfigs = orderedConfigs.Take(LOOKAHEAD_WINDOW + 1).ToDictionary(kv => kv.Key, kv => kv.Value);
+            var remainder = orderedConfigs.Skip(LOOKAHEAD_WINDOW + 1);
+
+            var initialProviders = GetResampledProviders(windowConfigs).ToList();
+            initialProviders.AddRange(GetUnsampledProviders(remainder.ToDictionary(kv => kv.Key, kv => kv.Value)));
+
+            _providers = initialProviders;
             _enumerator = new PeekingEnumerator<ISampleProvider>(_providers);
             _currentProvider = _enumerator.Current;
 
@@ -114,75 +162,71 @@ namespace MusicPlayer.Player
 
         }
 
+        // Cheap, immediate, no disk I/O beyond opening each file to read its own header (for TotalTime) - reads
+        // straight from the original source, never the resampled cache. This is what every queue entry outside
+        // the lookahead/retention window looks like: a real, valid EnhancedAudioFileReader (so Player.cs's
+        // polling can still read OriginalFilePath/TotalTime/EqualizerPreset off it), just not yet upgraded to a
+        // resampled one. Never used as _currentProvider while still in this state - EnsureWindowResampled always
+        // upgrades a track before playback can reach it (see the lookahead margin).
         private IEnumerable<ISampleProvider> GetUnsampledProviders(Dictionary<string, EqualizerPreset> trackConfigurations)
             => trackConfigurations.Keys.Select(file => new EnhancedAudioFileReader(serverFileName: null, originalFileName: file, equalizerPreset: trackConfigurations[file]));
 
         private IEnumerable<ISampleProvider> GetResampledProviders(Dictionary<string, EqualizerPreset> trackConfigurations)
         {
-            var resampledProviders = new List<ISampleProvider>();
+            var resampledProviders = new ConcurrentBag<EnhancedAudioFileReader>();
             var resampledProvidersFilePaths = FileManager.Instance.GetResampledProviderFileNames();
-            Parallel.ForEach(trackConfigurations.ToList(), config => WriteResampledFile(config, ref resampledProviders, resampledProvidersFilePaths.FirstOrDefault(serverFilePath => HasMatchingServerFileName(serverFilePath, config.Key))));
-            return resampledProviders.OrderBy(provider => trackConfigurations.Keys.ToList().IndexOf((provider as EnhancedAudioFileReader).OriginalFilePath));
+            Parallel.ForEach(trackConfigurations.ToList(), config =>
+            {
+                var existingServerFileName = resampledProvidersFilePaths.FirstOrDefault(serverFilePath => HasMatchingServerFileName(serverFilePath, config.Key));
+                resampledProviders.Add(WriteResampledFile(config.Key, config.Value, existingServerFileName));
+            });
+            return resampledProviders.OrderBy(provider => trackConfigurations.Keys.ToList().IndexOf(provider.OriginalFilePath));
         }
 
-        private void WriteResampledFile(KeyValuePair<string, EqualizerPreset> config, ref List<ISampleProvider> reSampledProviders, string serverFileName = null)
+        // Resamples (or reuses an existing cached resample of) a single track and returns the ready-to-play
+        // reader. Called both from GetResampledProviders (the initial window, resampled synchronously before
+        // playback starts - same as the old eager-everything behavior, just scoped to a handful of tracks
+        // instead of the whole queue) and from EnsureWindowResampled's background Task.Run calls (one track at a
+        // time, off the audio thread, as the rolling window advances).
+        private EnhancedAudioFileReader WriteResampledFile(string originalPath, EqualizerPreset preset, string existingServerFileName = null)
         {
-            if (!string.IsNullOrWhiteSpace(serverFileName))
+            if (!string.IsNullOrWhiteSpace(existingServerFileName))
             {
-                _logger.LogInformation("Reusing cached resample for {OriginalPath}: {ServerFileName}", config.Key, serverFileName);
-                reSampledProviders.Add(new EnhancedAudioFileReader(serverFileName: serverFileName, originalFileName: config.Key, equalizerPreset: config.Value));
-                return;
+                _logger.LogInformation("Reusing cached resample for {OriginalPath}: {ServerFileName}", originalPath, existingServerFileName);
+                return new EnhancedAudioFileReader(serverFileName: existingServerFileName, originalFileName: originalPath, equalizerPreset: preset);
             }
 
-            using (var reader = new AudioFileReader(config.Key))
+            using (var reader = new AudioFileReader(originalPath))
             {
-                // Diagnostic for the "some tracks play at ~2x speed" report (KNOWN_ISSUES.md #22) - reproduces
-                // even as the only track in the queue, which rules out the cache-collision fix already shipped
-                // for that item. Logging exactly what NAudio's AudioFileReader believes the SOURCE file's format
-                // is (before any resampling) is the most direct way to see whether it's misdetecting an unusual
-                // sample rate (e.g. hi-res 88.2/96kHz FLAC) rather than something in the resample/cache step.
+                // Diagnostic for the "some tracks play at ~2x speed" report (KNOWN_ISSUES.md #22) - kept in place
+                // since it's cheap and still useful signal if a similarly-shaped bug ever recurs for a track that
+                // only gets resampled once it's actually reached by the lazy window.
                 _logger.LogInformation(
                     "Resampling {OriginalPath}: source {SourceSampleRate}Hz/{SourceChannels}ch/{SourceBitsPerSample}bit ({SourceEncoding}) -> target {TargetSampleRate}Hz",
-                    config.Key, reader.WaveFormat.SampleRate, reader.WaveFormat.Channels, reader.WaveFormat.BitsPerSample, reader.WaveFormat.Encoding, SAMPLE_RATE);
+                    originalPath, reader.WaveFormat.SampleRate, reader.WaveFormat.Channels, reader.WaveFormat.BitsPerSample, reader.WaveFormat.Encoding, SAMPLE_RATE);
 
                 var resampler = new WdlResamplingSampleProvider(reader, SAMPLE_RATE);
 
                 // WdlResamplingSampleProvider only changes sample rate - it keeps the source's channel count
-                // as-is (confirmed via the diagnostic log above: BATTERY.mp3 reads as 1ch). Every cached WAV
-                // previously stayed mono for a mono source, but DynamicPlaylistSampleProvider.WaveFormat (below,
-                // in the constructor) is hardcoded to 2 channels, and Read() treats the underlying stream as
-                // interleaved stereo regardless. Reading a mono stream through a stereo-shaped pipeline packs two
-                // separate mono samples (two distinct instants in time) into what everything downstream treats as
-                // one stereo frame (one instant, left+right) - the audio timeline advances twice as fast for the
-                // same sample-consumption rate, which is exactly "2x speed" (KNOWN_ISSUES.md #22). Upmixing here,
-                // once, at cache-write time, means the cached file itself is always properly stereo, so nothing
-                // downstream (including a cache-hit read of this same file later) ever has to know the source was
-                // mono to begin with.
+                // as-is. Every cached WAV previously stayed mono for a mono source, but
+                // DynamicPlaylistSampleProvider.WaveFormat is hardcoded to 2 channels, and Read() treats the
+                // underlying stream as interleaved stereo regardless (KNOWN_ISSUES.md #22). Upmixing here, once,
+                // at cache-write time, means the cached file itself is always properly stereo.
                 ISampleProvider outputProvider = resampler;
                 if (resampler.WaveFormat.Channels == 1)
                     outputProvider = new MonoToStereoSampleProvider(resampler);
 
-                var resampledFilename = Path.Combine(new string[] { Constants.RESAMPLED_PROVIDERS_DIRECTORY, GetCacheFileName(config.Key) });
+                var resampledFilename = Path.Combine(new string[] { Constants.RESAMPLED_PROVIDERS_DIRECTORY, GetCacheFileName(originalPath) });
 
-                // Was CreateWaveFile16, which truncates every track to 16-bit PCM with no dithering regardless of
-                // source resolution — any 24-bit FLAC lost real resolution before it ever reached the Focusrite/
-                // KRKs. ToWaveProvider() keeps the resampler's output as 32-bit IEEE float, so the cache preserves
-                // full precision; only the sample rate is intentionally changed here, not bit depth. Safe to swap
-                // with no migration step: Program.cs clears RESAMPLED_PROVIDERS_DIRECTORY on every startup, so the
-                // cache regenerates in the new format automatically on next run.
+                // ToWaveProvider() keeps the resampler's output as 32-bit IEEE float, so the cache preserves full
+                // precision; only the sample rate is intentionally changed here, not bit depth.
                 WaveFileWriter.CreateWaveFile(resampledFilename, outputProvider.ToWaveProvider());
-                reSampledProviders.Add(new EnhancedAudioFileReader(serverFileName: resampledFilename, originalFileName: config.Key, equalizerPreset: config.Value));
+                return new EnhancedAudioFileReader(serverFileName: resampledFilename, originalFileName: originalPath, equalizerPreset: preset);
             }
         }
 
-        // Cache filename now includes a short hash of the FULL original path, not just its base filename.
-        // Previously two entirely different tracks that happened to share a base filename (common in a large
-        // library - generic rip names like "01 Intro.flac", or the same interlude/bonus-track name reused across
-        // albums) collided both on disk (the second track's resample silently overwrote/reused the first's
-        // cached .wav) and in HasMatchingServerFileName's lookup below - the wrong track's cached audio would get
-        // attached to a different track's queue slot, playing back as a mismatched or effectively "wrong speed"
-        // track. Hashing the full path makes the generated filename unique per source file regardless of how
-        // many tracks share the same name.
+        // Cache filename is a short hash of the FULL original path, not just its base filename, so two different
+        // tracks that happen to share a base filename can never collide on disk or in the lookup below.
         private static string GetCacheFileName(string originalPath)
         {
             using (var sha256 = SHA256.Create())
@@ -211,26 +255,66 @@ namespace MusicPlayer.Player
 
             _enumerator.ResetToPreviousElement();
             _currentProvider = _enumerator.Current;
+
+            // Moving backward shifts the window too - the track that's now RETENTION_WINDOW behind the new
+            // current might not be resampled (it could have been evicted a couple of tracks ago). Doesn't go
+            // through HandleEndOfProviderReached (this is a direct user-triggered jump, not a track boundary), so
+            // it needs its own call to keep the "always resampled within range" invariant intact.
+            EnsureWindowResampled();
         }
 
-        public void AddProviders(Dictionary<string, EqualizerPreset> configs, bool canAppend = true, string indexPath = null)
+        // Returns whether the add actually landed in _queuedProviders/_providers - KNOWN_ISSUES.md #23's "still
+        // open" note: this method already swallows every exception itself (logs and returns), so previously
+        // Player.AddToNowPlaying had no way to know an add had silently failed and always mutated its own display
+        // list (_queuedPlaylist) regardless, permanently desyncing it from the real engine queue on any future
+        // failure in here (not just the one confirmed trigger already fixed). The caller is now expected to skip
+        // its own list mutation when this returns false.
+        public bool AddProviders(Dictionary<string, EqualizerPreset> configs, bool canAppend = true, string indexPath = null)
         {
             try
             {
                 var queue = _queuedProviders.ToList();
 
+                // New queue entries are normally built unsampled here - cheap, immediate, no disk write. Whether
+                // and when any of them actually get resampled is entirely EnsureWindowResampled's call, based on
+                // where they land relative to current once they're merged into _providers. Previously this
+                // resampled everything immediately regardless of position, which is exactly the eager-upfront
+                // behavior that made a long queue expensive in disk space.
+                //
+                // The one exception: EnsureWindowResampled only ever runs at a track boundary or after
+                // PlayPreviousProvider - nothing calls it just from adding to the queue. If there's currently no
+                // next track at all (we're on the last one), a newly added track gets no lookahead margin: it
+                // would sit unsampled until the current track actually finishes, at which point
+                // EnsureWindowResampled's defensive fallback resamples it synchronously right at that boundary -
+                // a real, audible pause instead of a seamless transition, since the whole point of the lookahead
+                // window is to have finished well before it's needed. This method already isn't running on the
+                // audio thread (called via Player.AddToNowPlaying/PlayerHub), so giving just the first new track
+                // a head start here - resampled immediately, synchronously, before it's ever queued - means it's
+                // ready long before the current track ends instead of causing a gap right at the boundary.
+                var orderedConfigs = configs.ToList();
+                var newProviders = new List<ISampleProvider>();
+
+                if (!HasEffectiveNextProvider() && orderedConfigs.Any())
+                {
+                    var first = orderedConfigs[0];
+                    var resampledProvidersFilePaths = FileManager.Instance.GetResampledProviderFileNames();
+                    var existingServerFileName = resampledProvidersFilePaths.FirstOrDefault(serverFilePath => HasMatchingServerFileName(serverFilePath, first.Key));
+                    newProviders.Add(WriteResampledFile(first.Key, first.Value, existingServerFileName));
+                    orderedConfigs.RemoveAt(0);
+                }
+
+                newProviders.AddRange(GetUnsampledProviders(orderedConfigs.ToDictionary(kv => kv.Key, kv => kv.Value)));
+
                 if (!queue.Any())
                 {
-                    var trackConfigurations = new Dictionary<string, EqualizerPreset>();
-
                     queue.Add(new QueuedProviderInstruction
                     {
-                        Providers = GetResampledProviders(configs),
+                        Providers = newProviders,
                         CanAppend = canAppend,
                         IndexPath = indexPath,
                     });
                     _queuedProviders = queue;
-                    return;
+                    return true;
                 }
 
                 if (string.IsNullOrWhiteSpace(indexPath))
@@ -252,19 +336,19 @@ namespace MusicPlayer.Player
                     if (lastAppendingQueuedProvider != null)
                     {
                         var currentProviders = lastAppendingQueuedProvider.Providers.ToList();
-                        currentProviders.AddRange(GetResampledProviders(configs));
+                        currentProviders.AddRange(newProviders);
                         lastAppendingQueuedProvider.Providers = currentProviders;
-                        return;
+                        return true;
                     }
 
                     queue.Add(new QueuedProviderInstruction
                     {
-                        Providers = GetResampledProviders(configs),
+                        Providers = newProviders,
                         CanAppend = canAppend,
                         IndexPath = indexPath,
                     });
                     _queuedProviders = queue;
-                    return;
+                    return true;
                 }
 
                 foreach (var queuedProvider in queue.ToList())
@@ -275,29 +359,31 @@ namespace MusicPlayer.Player
                     if (index != -1)
                     {
                         if (canAppend)
-                            providers.AddRange(index, GetResampledProviders(configs));
+                            providers.AddRange(index, newProviders);
                         else
-                            providers.InsertRange(index, GetResampledProviders(configs));
+                            providers.InsertRange(index, newProviders);
 
                         queuedProvider.Providers = providers;
                         var amendedInstruction = queue.FirstOrDefault(instruction => string.Equals(instruction.IndexPath, queuedProvider.IndexPath));
                         amendedInstruction = queuedProvider;
                         _queuedProviders = queue;
-                        return;
+                        return true;
                     }
                 }
 
                 queue.Add(new QueuedProviderInstruction
                 {
-                    Providers = GetResampledProviders(configs),
+                    Providers = newProviders,
                     CanAppend = canAppend,
                     IndexPath = indexPath,
                 });
                 _queuedProviders = queue;
+                return true;
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Unable to add providers");
+                return false;
             }
         }
 
@@ -339,6 +425,12 @@ namespace MusicPlayer.Player
         {
             var finishedProvider = _currentProvider;
 
+            // Shuffle's "decide the order once" state (see the field comment above) only makes sense while
+            // actually in Shuffle mode - reset it here so switching away and back later reshuffles fresh instead
+            // of silently resuming whatever order was left over from the last time.
+            if (Player.Instance.PlaybackInformation.PlayerState.Mode != PlaybackMode.Shuffle)
+                _shuffleOrderEstablished = false;
+
             try
             {
                 AddQueuedProviders();
@@ -359,6 +451,12 @@ namespace MusicPlayer.Player
                         HandleSequentialPlayback();
                         break;
                 }
+
+                // Now that _currentProvider reflects wherever playback actually landed, top up the resampled
+                // window around it and evict whatever's fallen out of range. Deliberately after the mode-switch,
+                // not before - evicting/resampling relative to the OLD current would be off by one position
+                // relative to what's actually playing next.
+                EnsureWindowResampled();
 
                 // Null-guarded: HandleSequentialPlayback sets _currentProvider to null when the playlist has
                 // genuinely ended (no next track), and control still falls through to here. The old unguarded
@@ -434,14 +532,39 @@ namespace MusicPlayer.Player
         {
             (_currentProvider as EnhancedAudioFileReader).Reset();
 
-            var nextAvailableSources = _providers.Where(provider => !provider.Equals(_currentProvider)).ToList();
-            nextAvailableSources.Shuffle();
+            if (!_shuffleOrderEstablished)
+            {
+                // Only the not-yet-resampled remainder of the queue gets shuffled here, not whatever's already
+                // sitting resampled ahead of current in _providers - that head start was already committed to
+                // disk before shuffle was toggled on, and undoing it would mean nothing is immediately ready to
+                // advance onto right at this track boundary (a real "no next track" gap, since a fresh resample
+                // can't finish instantly). Practically: the track immediately after enabling shuffle plays in
+                // whatever order it was already queued for; everything from the one after that onward follows
+                // the fresh shuffle. EnsureWindowResampled (called right after this method returns, from
+                // HandleEndOfProviderReached) walks the now-shuffled remainder through the same lazy window as
+                // every other mode, so the shuffle stays genuinely seamless once established.
+                var providers = _providers.ToList();
+                var currentIndex = providers.FindIndex(provider => provider.Equals(_currentProvider));
+                var alreadyResampledAhead = currentIndex >= 0 ? providers.Skip(currentIndex + 1).ToList() : new List<ISampleProvider>();
+                var stillUnsampledAhead = alreadyResampledAhead.Where(provider => (provider as EnhancedAudioFileReader).ServerFilepath == null).ToList();
+                var resampledLookahead = alreadyResampledAhead.Except(stillUnsampledAhead).ToList();
 
-            var shuffledAvailableSources = nextAvailableSources.Prepend(_currentProvider);
-            _providers = shuffledAvailableSources;
+                stillUnsampledAhead.Shuffle();
 
-            _enumerator.Dispose();
-            _enumerator = new PeekingEnumerator<ISampleProvider>(_providers);
+                // Rebuild _providers with the (untouched, already-resampled) lookahead entries first, in their
+                // existing order, followed by the freshly shuffled remainder - this is the same
+                // mutate-then-ResetEnumerator pattern AddQueuedProviders already uses elsewhere in this class.
+                var rebuilt = new List<ISampleProvider>();
+                if (currentIndex > 0) rebuilt.AddRange(providers.Take(currentIndex));
+                rebuilt.Add(_currentProvider);
+                rebuilt.AddRange(resampledLookahead);
+                rebuilt.AddRange(stillUnsampledAhead);
+
+                _providers = rebuilt;
+                ResetEnumerator();
+
+                _shuffleOrderEstablished = true;
+            }
 
             HandleSequentialPlayback();
         }
@@ -503,6 +626,156 @@ namespace MusicPlayer.Player
                 QueuedProvidersAdded.Invoke(this, EventArgs.Empty);
         }
 
+        // Tops up the resampled lookahead window and evicts anything that's fallen out of the retention window
+        // behind current. Called at every track boundary (HandleEndOfProviderReached, right after the mode-switch
+        // advance) and after a manual PlayPreviousProvider jump, since both change what "ahead"/"behind" means.
+        //
+        // Nothing here ever mutates _providers from a background thread - resampling itself always happens off
+        // the audio thread via Task.Run, but a completed resample only gets swapped into _providers the next time
+        // this method runs (via _resampledSwapsReady), on the audio thread, the same safe point
+        // AddQueuedProviders already mutates _providers from. By the time a track is actually needed, its
+        // resample was kicked off LOOKAHEAD_WINDOW tracks earlier, so in the overwhelmingly common case it's long
+        // finished before playback ever reaches it - that's what makes the transition seamless, not any wait at
+        // the boundary itself.
+        private void EnsureWindowResampled()
+        {
+            var providers = _providers.ToList();
+
+            // Drain any background resamples that finished since the last check and splice them in at the same
+            // position the unsampled placeholder they're replacing was at. A track can finish resampling after
+            // it's been removed from the queue entirely (deleted while in flight) - in that case there's nowhere
+            // to swap it in, so just delete the now-orphaned cache file instead of leaving it on disk forever.
+            while (_resampledSwapsReady.TryDequeue(out var resampled))
+            {
+                var index = providers.FindIndex(provider => string.Equals((provider as EnhancedAudioFileReader).OriginalFilePath, resampled.OriginalFilePath, StringComparison.OrdinalIgnoreCase));
+                _resamplingInFlight.TryRemove(resampled.OriginalFilePath, out _);
+
+                if (index == -1)
+                {
+                    resampled.Dispose();
+                    if (!string.IsNullOrWhiteSpace(resampled.ServerFilepath))
+                        FileManager.Instance.RemoveFile(resampled.ServerFilepath);
+                    continue;
+                }
+
+                // If the track that just finished resampling happens to be whatever's sitting at the current
+                // position (only possible via the synchronous-fallback path below racing a background resample
+                // for the same track - rare, but not impossible), _currentProvider itself needs to be
+                // redirected to the new object, not just the entry in `providers` - Read() always reads
+                // _currentProvider directly, so leaving it pointed at the old object would mean the upgrade
+                // never actually takes effect for playback even though _providers looks correct.
+                var previous = providers[index] as EnhancedAudioFileReader;
+                var wasCurrent = previous != null && previous.Equals(_currentProvider);
+                providers[index] = resampled;
+                if (wasCurrent) _currentProvider = resampled;
+                previous?.Dispose();
+            }
+
+            var currentIndex = providers.FindIndex(provider => provider.Equals(_currentProvider));
+            if (currentIndex == -1)
+            {
+                _providers = providers;
+                ResetEnumerator();
+                return;
+            }
+
+            // Defensive fallback: every normal transition path guarantees _currentProvider is already resampled
+            // before it's ever set as current (the initial window in the constructor, or the lookahead upgrade
+            // below completing before playback reaches a track). The one path that can't guarantee that is
+            // RepeatAll wrapping back to the start of the queue - by the time a long queue's last track finishes,
+            // everything at the front was likely evicted many tracks ago (RETENTION_WINDOW is only 1), so landing
+            // back on track 0 can mean landing on a genuinely unsampled reader. Reading that directly would bypass
+            // the resample/upmix pipeline entirely and reintroduce the "2x speed" class of bug (KNOWN_ISSUES.md
+            // #22) for any mono or non-target-sample-rate source, so this can't be left to the normal background
+            // path - resample synchronously, right here. Rare enough (at most once per full RepeatAll lap) that a
+            // brief pause here is an acceptable trade-off for correctness over the seamless-in-the-common-case
+            // background path used everywhere else.
+            var current = providers[currentIndex] as EnhancedAudioFileReader;
+            if (current != null && current.ServerFilepath == null)
+            {
+                _resamplingInFlight.TryRemove(current.OriginalFilePath, out _);
+                var resampledProvidersFilePaths = FileManager.Instance.GetResampledProviderFileNames();
+                var existingServerFileName = resampledProvidersFilePaths.FirstOrDefault(serverFilePath => HasMatchingServerFileName(serverFilePath, current.OriginalFilePath));
+                var resampledCurrent = WriteResampledFile(current.OriginalFilePath, current.EqualizerPreset, existingServerFileName);
+
+                providers[currentIndex] = resampledCurrent;
+                _currentProvider = resampledCurrent;
+                current.Dispose();
+            }
+
+            var windowStart = Math.Max(0, currentIndex - RETENTION_WINDOW);
+            var windowEnd = Math.Min(providers.Count - 1, currentIndex + LOOKAHEAD_WINDOW);
+
+            for (int i = windowStart; i <= windowEnd; i++)
+            {
+                var provider = providers[i] as EnhancedAudioFileReader;
+                if (provider == null || provider.ServerFilepath != null) continue; // already resampled
+                if (_resamplingInFlight.ContainsKey(provider.OriginalFilePath)) continue; // already in flight
+
+                _resamplingInFlight.TryAdd(provider.OriginalFilePath, 0);
+                var originalPath = provider.OriginalFilePath;
+                var preset = provider.EqualizerPreset;
+
+                Task.Run(() =>
+                {
+                    try
+                    {
+                        var resampledProvidersFilePaths = FileManager.Instance.GetResampledProviderFileNames();
+                        var existingServerFileName = resampledProvidersFilePaths.FirstOrDefault(serverFilePath => HasMatchingServerFileName(serverFilePath, originalPath));
+                        var resampled = WriteResampledFile(originalPath, preset, existingServerFileName);
+
+                        // KNOWN_ISSUES.md - if Dispose() already ran (e.g. Player.Play() started a new playlist
+                        // right as this lookahead resample kicked off), nothing will ever call
+                        // EnsureWindowResampled again to drain this queue - previously this landed in
+                        // _resampledSwapsReady forever, leaking both the open file handle and its cache .wav on
+                        // disk for the rest of the process's life. Checking disposedValue here closes the common
+                        // case (still in flight at Dispose time); Dispose(bool) itself also drains whatever's
+                        // already sitting in the queue for the case where the resample finished just before it ran.
+                        if (disposedValue)
+                        {
+                            resampled.Dispose();
+                            if (!string.IsNullOrWhiteSpace(resampled.ServerFilepath))
+                                FileManager.Instance.RemoveFile(resampled.ServerFilepath);
+                        }
+                        else
+                        {
+                            _resampledSwapsReady.Enqueue(resampled);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogError(ex, "Unable to resample {OriginalPath} for the lazy playback window", originalPath);
+                    }
+                    finally
+                    {
+                        _resamplingInFlight.TryRemove(originalPath, out _);
+                    }
+                });
+            }
+
+            // Anything resampled but now outside [windowStart, windowEnd] gets downgraded back to a cheap
+            // unsampled reader - dispose the resampled reader (closes the cache file's handle), delete the cache
+            // file, and replace it in-place with a fresh source-backed reader so Player.cs's polling still has a
+            // valid TotalTime/OriginalFilePath to read for that queue row. Never touches the current track itself
+            // (i between windowStart/windowEnd always includes currentIndex).
+            for (int i = 0; i < providers.Count; i++)
+            {
+                if (i >= windowStart && i <= windowEnd) continue;
+
+                var provider = providers[i] as EnhancedAudioFileReader;
+                if (provider == null || provider.ServerFilepath == null) continue; // already unsampled, nothing to evict
+
+                var cacheFilePath = provider.ServerFilepath;
+                var replacement = new EnhancedAudioFileReader(serverFileName: null, originalFileName: provider.OriginalFilePath, equalizerPreset: provider.EqualizerPreset);
+                providers[i] = replacement;
+                provider.Dispose();
+                FileManager.Instance.RemoveFile(cacheFilePath);
+            }
+
+            _providers = providers;
+            ResetEnumerator();
+        }
+
         public void ReOrderProviders(string[] paths) => _proposedOrder = paths.ToList();
 
         public void RemoveProvider(string[] paths)
@@ -526,14 +799,23 @@ namespace MusicPlayer.Player
             }
             _queuedProviders = newQueuedProviders;
             _removedProviders.AddRange(paths);
+
+            // A track can be deleted from the queue while its background resample is still in flight - it'll
+            // still finish and land in _resampledSwapsReady, but EnsureWindowResampled's drain step already
+            // handles that case (no matching entry left in _providers -> dispose + delete the orphaned cache
+            // file instead of swapping it in), so nothing extra is needed here beyond letting _resamplingInFlight
+            // naturally get cleared when that drain runs.
         }
 
+        // Re-locates the enumerator against _currentProvider (the class field), not _enumerator.Current - the two
+        // are normally the same object, but EnsureWindowResampled can replace whatever's sitting at the current
+        // position with a freshly-resampled instance (and updates _currentProvider to match) before calling this,
+        // in which case _enumerator's own stale internal reference would never be found in the new _providers list.
         private void ResetEnumerator()
         {
-            var currentProvider = _enumerator.Current;
             _enumerator.Dispose();
             _enumerator = new PeekingEnumerator<ISampleProvider>(_providers);
-            _enumerator.MoveToElement(currentProvider);
+            _enumerator.MoveToElement(_currentProvider);
         }
 
         // The "logical" current queue - _providers with any pending removal already subtracted and any
@@ -616,8 +898,33 @@ namespace MusicPlayer.Player
                     _enumerator?.Dispose();
                     _queuedProviders = null;
 
+                    // Drain anything a background lookahead resample already finished and queued up but that
+                    // never got the chance to be picked up by EnsureWindowResampled (e.g. Player.Play() disposing
+                    // this provider to start a new playlist right as a resample landed). Without this, each
+                    // entry's open file handle and its cache .wav on disk would leak for the rest of the process's
+                    // life - nothing else will ever drain this queue once this instance is gone. Anything still
+                    // genuinely in flight at this exact moment is instead caught by the disposedValue check inside
+                    // the Task.Run closure below, once it completes.
+                    while (_resampledSwapsReady.TryDequeue(out var resampled))
+                    {
+                        resampled.Dispose();
+                        if (!string.IsNullOrWhiteSpace(resampled.ServerFilepath))
+                            FileManager.Instance.RemoveFile(resampled.ServerFilepath);
+                    }
+
+                    // Cache files only ever exist for tracks that were actually resampled (ServerFilepath set) -
+                    // with the lazy window that's normally just a handful, not the whole queue. Deleting them
+                    // here (rather than leaving them for the next MusicServer restart's full-directory clear, the
+                    // only other place this ever happened before) means switching to a new playlist via
+                    // Player.Play() doesn't leave the previous one's cache behind for the rest of the session.
                     foreach (var provider in _providers)
-                        (provider as EnhancedAudioFileReader).Dispose();
+                    {
+                        var reader = provider as EnhancedAudioFileReader;
+                        var cacheFilePath = reader?.ServerFilepath;
+                        reader?.Dispose();
+                        if (!string.IsNullOrWhiteSpace(cacheFilePath))
+                            FileManager.Instance.RemoveFile(cacheFilePath);
+                    }
 
                     _providers = null;
                 }

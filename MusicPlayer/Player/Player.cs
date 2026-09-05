@@ -121,6 +121,13 @@ namespace MusicPlayer.Player
 
             var trackConfigurations = _queuedPlaylist.ToDictionary(track => track.Path, Track => Track.EqualizerPreset);
 
+            // Starting a new playlist previously just dropped the old DynamicPlaylistSampleProvider reference
+            // without disposing it - harmless before the lazy resample window existed (the whole queue was
+            // already fully resampled up front regardless), but now it would leave whatever handful of tracks
+            // were resampled for the previous playlist orphaned on disk for the rest of the session (only ever
+            // cleaned up by the next MusicServer restart's full-directory clear). Disposing here deletes those
+            // cache files immediately - see DynamicPlaylistSampleProvider.Dispose.
+            _playlistProvider?.Dispose();
             _playlistProvider = new DynamicPlaylistSampleProvider(trackConfigurations, _bandCenterFrequencies);
             _playlistProvider.ReachedEndOfProvider += HandleReachedEndOfTrack;
             _playlistProvider.ReachedEndOfPlaylist += HandleReachedEndOfPlaylist;
@@ -338,7 +345,16 @@ namespace MusicPlayer.Player
             {
                 var trackInfos = new List<PlaylistTrack>(paths.Select(LibraryManager.Instance.GetTrackInformation));
                 var trackConfigs = trackInfos.ToDictionary(info => info.Path, info => info.EqualizerPreset);
-                _playlistProvider.AddProviders(trackConfigs, canAppend, indexPath);
+
+                // KNOWN_ISSUES.md #23's "still open" note: AddProviders swallows its own exceptions and used to
+                // return void, so a failure in there (anything beyond the one confirmed trigger already fixed)
+                // was invisible here - _queuedPlaylist (the display list) got the new tracks appended regardless
+                // of whether the real engine queue (_playlistProvider.Providers) actually took them, permanently
+                // desyncing the two and tripping UpdatePlaybackInformation's count-mismatch guard for the rest of
+                // the session. Only touch _queuedPlaylist when the add is confirmed to have actually landed.
+                var added = _playlistProvider.AddProviders(trackConfigs, canAppend, indexPath);
+                if (!added) return;
+
                 var queuePathsOrder = _playlistProvider.Providers.Select(provider => (provider as EnhancedAudioFileReader).OriginalFilePath).ToList();
                 _queuedPlaylist.AddRange(trackInfos);
                 _queuedPlaylist = _queuedPlaylist.OrderBy(track => queuePathsOrder.IndexOf(track.Path)).ToList();

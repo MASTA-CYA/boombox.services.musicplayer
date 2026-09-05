@@ -61,6 +61,14 @@ namespace MusicServer.Hubs
                 var appDataFilePath = filePaths.FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), album.Guid.ToString()));
                 var fileJson = FileManager.Instance.Read(appDataFilePath);
                 var cachedAlbum = JsonConvert.DeserializeObject<Album>(fileJson, settings: JsonSerializationHelper.FileSerializerSettings);
+
+                // Same staleness as the library grid's fast cache path (see GetLibraryResponseFromFileAsync) -
+                // this album's JSON cache only gets its IsFavourite/TimesPlayed fields refreshed when it's next
+                // mapped/refreshed, not when a favourite gets toggled elsewhere (the player, another album's
+                // grid). Without this, opening this album's detail page could show a track as not-favourited
+                // even though the player - which patches its own in-memory state live - shows it as favourited.
+                await LibraryManager.Instance.ApplyLiveTrackUserDataAsync(cachedAlbum);
+
                 return JsonConvert.SerializeObject(cachedAlbum, JsonSerializationHelper.NamingSerializerSettings);
             }
             catch (Exception ex)
@@ -212,6 +220,14 @@ namespace MusicServer.Hubs
 
                     });
                     if (albums.Count == 0) throw new Exception("No matching files found in application directory");
+
+                    // This is the fast "Cache" path - deserializing each per-album JSON file straight off disk,
+                    // no mapping pass. Those files only get their IsFavourite/TimesPlayed fields refreshed when
+                    // that specific album is next mapped/refreshed, so without this overlay every normal library
+                    // load (this is the common path, see the comment above GetLibraryResponseFromFileAsync)
+                    // would show whatever favourite state was true the last time each album happened to be
+                    // mapped - not live trackUserData. See LibraryManager.ApplyLiveTrackUserDataAsync.
+                    await LibraryManager.Instance.ApplyLiveTrackUserDataAsync(albums);
 
                     mappingUpdate.IsComplete = true;
                     return JsonConvert.SerializeObject(albums, JsonSerializationHelper.NamingSerializerSettings);
