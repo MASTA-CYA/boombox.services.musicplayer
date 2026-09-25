@@ -1,8 +1,11 @@
 ﻿using Microsoft.AspNetCore.SignalR;
 using MusicPlayer.Common;
+using MusicPlayer.LibraryManagement;
+using MusicPlayer.LyricsManagement;
 using MusicPlayer.Player;
 using MusicPlayer.Player.Models;
 using MusicServer.Helpers;
+using MusicServer.Startup;
 using Newtonsoft.Json;
 using System.Runtime.Versioning;
 
@@ -15,6 +18,14 @@ namespace MusicServer.Hubs
         public async Task InitializePlayerAsync()
         {
             ExecuteOnPlayerThread(InitializePlayer);
+
+            // Same "start once per connection, run for its lifetime regardless of playback state" pattern as
+            // ServerHub.StartServerStatusUpdatedAsync/ServerStatusBroadcast - the frontend calls
+            // InitializePlayerAsync once, unconditionally, as part of its own startup sequence
+            // (PlayerService.startConnectionAsync), so this is the natural place to kick availability
+            // monitoring off without needing a new hub method the frontend would have to remember to call.
+            AudioOutputAvailabilityBroadcast.Start();
+
             await Task.CompletedTask;
         }
 
@@ -27,7 +38,7 @@ namespace MusicServer.Hubs
             else
                 ExecuteOnPlayerThread(() => PlayAudioFiles(paths));
 
-            _ = Task.Run(ServerHttpClient.Instance.StartPlaybackInformationBroadcastAsync);
+            PlaybackBroadcast.Start();
             await Task.CompletedTask;
         }
 
@@ -55,16 +66,23 @@ namespace MusicServer.Hubs
             await Task.CompletedTask;
         }
 
+        // Broadcasts immediately afterward for the same reason SetAudioOutputAsync does - PlaybackBroadcast's
+        // 500ms loop only runs while something is actually playing, so without this, reordering while
+        // paused/stopped would update the backend but never reach the UI until playback resumed.
         public async Task ReorderNowPlayingAsync(string[] paths)
         {
             ExecuteOnPlayerThread(() => ReorderNowPlaying(paths));
-            await Task.CompletedTask;
+            await SendPlaybackInformationAsync();
         }
 
+        // Broadcasts immediately afterward for the same reason ReorderNowPlayingAsync/SetAudioOutputAsync do -
+        // PlaybackBroadcast's 500ms loop only runs while something is actually playing, so without this,
+        // deleting a track while paused/stopped would update the backend but never reach the UI until playback
+        // resumed.
         public async Task RemoveNowPlayingTrackAsync(string[] paths)
         {
             ExecuteOnPlayerThread(() => RemoveNowPlayingTrack(paths));
-            await Task.CompletedTask;
+            await SendPlaybackInformationAsync();
         }
 
         public async Task AddToNowPlayingAsync(string[] paths, bool canAppend, string? indexPath)
@@ -85,6 +103,68 @@ namespace MusicServer.Hubs
             await Task.CompletedTask;
         }
 
+        // Everything below backs Settings' "Equalizer" tab. None of it touches the live audio pipeline
+        // (_playlistProvider/_audioPlayer) the way Play/Pause/SetAudioOutput/SetEqualizerPresets above do, so
+        // unlike those, there's no need to marshal onto the STA player thread via ExecuteOnPlayerThread - it's
+        // plain Mongo/JSON I/O and can run directly on whatever thread SignalR invokes this on.
+        public async Task<string> GetEqualizerManagementDataAsync()
+        {
+            var presets = await MongoDbClient.Instance.GetEqualizerPresetsAsync();
+            var assignments = await LibraryManager.Instance.GetTrackEqualizerAssignmentsAsync();
+            return JsonConvert.SerializeObject(new { presets, assignments }, JsonSerializationHelper.NamingSerializerSettings);
+        }
+
+        public async Task<string> CreateEqualizerPresetAsync(string name)
+        {
+            var preset = await Player.Instance.CreateEqualizerPresetAsync(name);
+            return JsonConvert.SerializeObject(preset, JsonSerializationHelper.NamingSerializerSettings);
+        }
+
+        public async Task UpdateNamedEqualizerPresetAsync(EqualizerPreset preset) => await Player.Instance.UpdateNamedEqualizerPresetAsync(preset);
+
+        public async Task DeleteEqualizerPresetAsync(Guid guid) => await Player.Instance.DeleteEqualizerPresetAsync(guid);
+
+        // GetEqualizerManagementDataAsync's assignment list is deliberately lightweight (album/track name, path,
+        // and just the assigned preset's Guid - see TrackEqualizerAssignment) rather than embedding every
+        // assignment's full band data up front. This fetches one specific per-track preset's full bands, on
+        // demand, only when the user actually opens it for editing.
+        public async Task<string> GetTrackEqualizerPresetAsync(string trackPath)
+        {
+            var preset = await MongoDbClient.Instance.GetEqualizerPresetAsync(trackPath);
+            return JsonConvert.SerializeObject(preset, JsonSerializationHelper.NamingSerializerSettings);
+        }
+
+        public async Task UpdateTrackEqualizerPresetAsync(string trackPath, EqualizerPreset preset) => await LibraryManager.Instance.UpdateTrackEqualizerPresetAsync(trackPath, preset);
+
+        public async Task DeleteTrackEqualizerPresetAsync(string trackPath) => await LibraryManager.Instance.DeleteTrackEqualizerPresetAsync(trackPath);
+
+        // Lyrics, same reasoning as the equalizer management block above - LyricsManager.GetLyricsAsync is
+        // plain Mongo I/O plus (on a cache miss only) a tag read/LRCLIB call/sidecar file read, none of which
+        // touch the live audio pipeline, so no ExecuteOnPlayerThread needed. That first-time cache-miss lookup
+        // is why this one can occasionally take noticeably longer than everything else in this file (an LRCLIB
+        // round-trip) - every call after the first for a given track is a single fast Mongo lookup.
+        public async Task<string> GetTrackLyricsAsync(string trackPath)
+        {
+            var lyrics = await LyricsManager.Instance.GetLyricsAsync(trackPath);
+            return JsonConvert.SerializeObject(lyrics, JsonSerializationHelper.NamingSerializerSettings);
+        }
+
+        public async Task<string> SaveManualLyricsAsync(string trackPath, string rawText)
+        {
+            var lyrics = await LyricsManager.Instance.SaveManualLyricsAsync(trackPath, rawText);
+            return JsonConvert.SerializeObject(lyrics, JsonSerializationHelper.NamingSerializerSettings);
+        }
+
+        // Runs on the same STA player thread as every other action here - both AsioOut and WasapiOut are
+        // COM-based. Broadcasts the updated PlaybackInformation immediately afterward rather than waiting for
+        // PlaybackBroadcast's 500ms loop, since that loop only runs while something is actually playing - without
+        // this, switching output while paused/stopped would silently update the backend but never reach the UI.
+        public async Task SetAudioOutputAsync(AudioOutput output)
+        {
+            ExecuteOnPlayerThread(() => SetAudioOutput(output));
+            await SendPlaybackInformationAsync();
+        }
+
         #endregion Public Methods
 
         #region Private Methods
@@ -99,20 +179,13 @@ namespace MusicServer.Hubs
             await Clients.All.SendAsync("ReceivePlaybackInformation", playbackInfoJson);
         }
 
+        // Delegates to the shared PlayerThreadExecutor (MusicServer/Helpers) rather than spinning up its own
+        // STA thread inline - AudioOutputAvailabilityBroadcast needs the exact same STA guarantee for a
+        // server-initiated output switch, so the actual thread-marshalling logic now lives in one place.
         [SupportedOSPlatform("windows")]
         private void ExecuteOnPlayerThread(Action action)
-        {
-            var thread = new Thread(() => ErrorHandlingAction(action));
-            thread.SetApartmentState(ApartmentState.STA);
-            thread.Start();
-            thread.Join();
-        }
+            => PlayerThreadExecutor.Execute(action, ex => Task.Run(async () => await Clients.All.SendAsync("ReceivePlayerHubError", ex.Message)));
 
-        private void ErrorHandlingAction(Action action)
-        {
-            try { action.Invoke(); }
-            catch (Exception ex) { Task.Run(async () => await Clients.All.SendAsync("ReceivePlayerHubError", ex.Message)); }
-        }
         private async Task ErrorHandlingActionAsync(Func<Task> action)
         {
             try { await action.Invoke(); }
@@ -141,6 +214,7 @@ namespace MusicServer.Hubs
         private static void ReorderNowPlaying(string[] paths) => Player.Instance.ReorderNowPlayingPlaylist(paths);
         private static void RemoveNowPlayingTrack(string[] paths) => Player.Instance.RemoveNowPlayingTrack(paths);
         private static void ApplyEqualizerPreset(EqualizerPreset preset) => Player.Instance.ApplyEqualizerPreset(preset);
+        private static void SetAudioOutput(AudioOutput output) => Player.Instance.SetAudioOutput(output);
 
         #endregion Private Methods
     }

@@ -211,12 +211,10 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="Common\AppLogger.cs" />
     <Compile Include="Common\Constants.cs" />
     <Compile Include="Common\Debouncer.cs" />
-    <Compile Include="Common\Models\LogEntry.cs" />
-    <Compile Include="Common\Models\Severity.cs" />
     <Compile Include="Common\MongoDbClient.cs" />
-    <Compile Include="Common\ServerHttpClient.cs" />
     <Compile Include="Extensions\DictionaryExtensions.cs" />
     <Compile Include="Extensions\ListExtensions.cs" />
     <Compile Include="Extensions\SampleProviderExtensions.cs" />
@@ -227,10 +225,19 @@
     <Compile Include="LibraryManagement\LibraryManager.cs" />
     <Compile Include="LibraryManagement\Models\Album.cs" />
     <Compile Include="LibraryManagement\Models\FavouriteTrackEventArgs.cs" />
+    <Compile Include="LibraryManagement\Models\MappingRunType.cs" />
+    <Compile Include="LibraryManagement\Models\MappingStatistic.cs" />
     <Compile Include="LibraryManagement\Models\MappingUpdate.cs" />
     <Compile Include="AutoScrollManagement\Models\ScrollPosition.cs" />
     <Compile Include="LibraryManagement\Models\Track.cs" />
     <Compile Include="LibraryManagement\Models\TrackUserData.cs" />
+    <Compile Include="LyricsManagement\Models\Lyrics.cs" />
+    <Compile Include="LyricsManagement\Models\LyricsLine.cs" />
+    <Compile Include="LyricsManagement\Models\LyricsSource.cs" />
+    <Compile Include="LyricsManagement\LrcParser.cs" />
+    <Compile Include="LyricsManagement\LrclibResponse.cs" />
+    <Compile Include="LyricsManagement\LrclibClient.cs" />
+    <Compile Include="LyricsManagement\LyricsManager.cs" />
     <Compile Include="AutoScrollManagement\ScrollManager.cs" />
     <Compile Include="LibraryManagement\Models\UserData.cs" />
     <Compile Include="Player\Models\EqualizerFrequencyBand.cs" />
@@ -238,11 +245,14 @@
     <Compile Include="Player\Models\ProviderPathsEventArgs.cs" />
     <Compile Include="Player\Models\CurrentProviderEventArgs.cs" />
     <Compile Include="Player\Models\QueuedProviderInstruction.cs" />
+    <Compile Include="Player\Models\TrackEqualizerAssignment.cs" />
     <Compile Include="Player\Sample Providers\DynamicPlaylistSampleProvider.cs" />
     <Compile Include="Player\Sample Providers\EnhancedAudioFileReader.cs" />
     <Compile Include="Player\Models\PlaybackInformation.cs" />
     <Compile Include="Player\Models\PlaybackMode.cs" />
     <Compile Include="Player\Models\PlayerState.cs" />
+    <Compile Include="Player\Models\AudioOutput.cs" />
+    <Compile Include="Player\Models\PlayerSettings.cs" />
     <Compile Include="PlaylistManagement\Models\PlaylistTrack.cs" />
     <Compile Include="Common\PeekingEnumerator.cs" />
     <Compile Include="Player\Player.cs" />

@@ -5,16 +5,26 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <UserSecretsId>8a8eae18-389f-4a32-861f-921db8950f0d</UserSecretsId>
-    <Deterministic>false</Deterministic>
-    <AssemblyVersion>1.0.*</AssemblyVersion>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Semantic versioning, derived from MusicServer/version.json + git commit height (see that file's comment).
+         Replaces the old <Deterministic>false</Deterministic> + <AssemblyVersion>1.0.*</AssemblyVersion> wildcard
+         trick, which just auto-stamped a build/revision number from the compile date/time - not semver, and
+         major.minor was frozen at 1.0 forever. PrivateAssets="all" per Nerdbank.GitVersioning's own setup docs, to
+         avoid it becoming a transitive dependency of anything that references this project. -->
+    <PackageReference Include="Nerdbank.GitVersioning" Version="3.10.85" PrivateAssets="all" />
     <PackageReference Include="Microsoft.AspNetCore.SignalR.Protocols.NewtonsoftJson" Version="10.0.7" />
     <PackageReference Include="Microsoft.Extensions.Caching.StackExchangeRedis" Version="10.0.2" />
     <PackageReference Include="Microsoft.VisualStudio.Azure.Containers.Tools.Targets" Version="1.22.1" />
     <PackageReference Include="MongoDB.Bson" Version="3.7.1" />
     <PackageReference Include="NAudio.Asio" Version="2.2.1" />
+    <PackageReference Include="Serilog.AspNetCore" Version="10.0.0" />
+    <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+    <!-- PerformanceCounter isn't in the .NET 8 shared framework anymore - needed by the /api/status endpoint
+         (Program.cs) for live CPU/IO stats, feeding the Homepage dashboard widget. Windows-only, same as the
+         ASIO/WASAPI code this app already depends on. -->
+    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="9.0.0" />
     <PackageReference Include="StackExchange.Redis" Version="2.10.1" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
     <PackageReference Include="System.Security.Permissions" Version="10.0.6" />

@@ -1,30 +1,30 @@
 ﻿using Microsoft.AspNetCore.SignalR;
-using MusicPlayer.Common;
 using MusicPlayer.PlaylistManagement;
 using MusicPlayer.PlaylistManagement.Models;
 using MusicServer.Helpers;
+using MusicServer.Startup;
 using System.Text.Json;
 
 namespace MusicServer.Hubs
 {
-    public class PlaylistHub : Hub
+    public class PlaylistHub(ILogger<PlaylistHub> logger) : Hub
     {
+        private readonly ILogger<PlaylistHub> _logger = logger;
+
         public async Task GetPlaylistsAsync()
         {
             List<Playlist> playlists = [];
 
+            // Used to also attempt a "Playlists" Redis cache merge here (behind a hardcoded `throw new
+            // Exception();` that unconditionally skipped it - dead/incomplete code, nothing ever wrote that key).
+            // Removed along with the same dead attempt in PlaylistBroadcast.RunAsync - see the comment there.
             try
             {
-                throw new Exception();
                 playlists = await PlaylistManager.Instance.GetPlaylistsAsync();
-                var playlistsResponse = await RedisCache.GetAsync("Playlists");
-                playlists.AddRange(JsonSerializer.Deserialize<List<Playlist>>(playlistsResponse));
             }
             catch (Exception ex)
             {
-                playlists = await PlaylistManager.Instance.GetPlaylistsAsync();
-                //playlists.AddRange(await PlaylistManager.Instance.GetPlaylistsAsync());
-                //await Clients.All.SendAsync("ReceivePlaylistHubError", ex.Message);
+                _logger.LogWarning(ex, "Unable to load playlists");
             }
 
             var playlistJson = JsonSerializer.Serialize(playlists, JsonSerializationHelper.SerializerOptions);
@@ -34,13 +34,13 @@ namespace MusicServer.Hubs
         public async Task StartPlayingUpdatesAsync()
         {
             await Task.CompletedTask;
-            _ = Task.Run(ServerHttpClient.Instance.StartPlaylistBroadcastAsync);
+            PlaylistBroadcast.Start();
         }
 
         public async Task StopPlayingUpdatesAsync()
         {
             await Task.CompletedTask;
-            _ = Task.Run(ServerHttpClient.Instance.StopPlaylistBroadcastAsync);
+            PlaylistBroadcast.Stop();
         }
     }
 }

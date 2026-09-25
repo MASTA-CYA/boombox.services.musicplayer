@@ -1,5 +1,5 @@
 ﻿using Microsoft.AspNetCore.SignalR;
-using MusicPlayer.Common;
+using MusicServer.Startup;
 
 namespace MusicServer.Hubs
 {
@@ -11,8 +11,16 @@ namespace MusicServer.Hubs
             return true;
         }
 
-        public async Task StartServerStatusUpdatedAsync() => await ServerHttpClient.Instance.StartServerStatusUpdatesAsync();
+        public async Task StartServerStatusUpdatedAsync()
+        {
+            await Task.CompletedTask;
+            ServerStatusBroadcast.Start();
+        }
 
-        public async Task StopServerStatusUpdatedAsync() => await ServerHttpClient.Instance.StopServerStatusUpdatesAsync();
+        public async Task StopServerStatusUpdatedAsync()
+        {
+            await Task.CompletedTask;
+            ServerStatusBroadcast.Stop();
+        }
     }
 }

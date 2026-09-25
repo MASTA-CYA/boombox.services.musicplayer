@@ -3,16 +3,19 @@ using MusicPlayer.Common;
 using MusicPlayer.FileManagement;
 using MusicPlayer.LibraryManagement;
 using MusicPlayer.LibraryManagement.Models;
-using MusicPlayer.Models;
 using MusicServer.Helpers;
 using Newtonsoft.Json;
 using StackExchange.Redis;
 using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Threading;
 
 namespace MusicServer.Hubs
 {
-    public class LibraryHub : Hub
+    public class LibraryHub(ILogger<LibraryHub> logger) : Hub
     {
+        private readonly ILogger<LibraryHub> _logger = logger;
+
         #region Public Methods
         public async Task GetLibraryAsync()
         {
@@ -20,20 +23,12 @@ namespace MusicServer.Hubs
 
             try
             {
-                await ServerHttpClient.Instance.StartMappingBroadcastAsync();
                 await SendMappingUpdate(message: "Attempting to get library mapping from cache");
                 libraryResponse = await GetLibraryResponseFromFileAsync();
             }
             catch (Exception ex)
             {
-                _ = Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetLibraryAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
+                _logger.LogError(ex, "Unable to get library mapping from cache");
                 await SendMappingUpdate(error: ex.Message);
                 await SendMappingUpdate(message: "Unable to get library mapping from cache");
 
@@ -41,7 +36,6 @@ namespace MusicServer.Hubs
                 _ = Task.Run(async () => await SaveLibraryResponseToFileAsync(libraryResponse));
             }
 
-            await ServerHttpClient.Instance.StopMappingBroadcastAsync();
             await Clients.All.SendAsync("ReceiveLibrary", libraryResponse.ToString());
         }
 
@@ -67,19 +61,19 @@ namespace MusicServer.Hubs
                 var appDataFilePath = filePaths.FirstOrDefault(file => string.Equals(Path.GetFileNameWithoutExtension(file), album.Guid.ToString()));
                 var fileJson = FileManager.Instance.Read(appDataFilePath);
                 var cachedAlbum = JsonConvert.DeserializeObject<Album>(fileJson, settings: JsonSerializationHelper.FileSerializerSettings);
+
+                // Same staleness as the library grid's fast cache path (see GetLibraryResponseFromFileAsync) -
+                // this album's JSON cache only gets its IsFavourite/TimesPlayed fields refreshed when it's next
+                // mapped/refreshed, not when a favourite gets toggled elsewhere (the player, another album's
+                // grid). Without this, opening this album's detail page could show a track as not-favourited
+                // even though the player - which patches its own in-memory state live - shows it as favourited.
+                await LibraryManager.Instance.ApplyLiveTrackUserDataAsync(cachedAlbum);
+
                 return JsonConvert.SerializeObject(cachedAlbum, JsonSerializationHelper.NamingSerializerSettings);
             }
             catch (Exception ex)
             {
-                _ = Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetSelectedAlbumAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine(ex.Message);
+                _logger.LogError(ex, "Unable to get selected album");
                 return LibraryManager.Instance.SelectedAlbum;
             }
         }
@@ -102,6 +96,23 @@ namespace MusicServer.Hubs
             await Clients.All.SendAsync("ReceiveRefreshedAlbum");
         }
 
+        // Feeds the Settings > Mapping Statistics tab. One-shot request/response like GetSelectedAlbumAsync, not a
+        // broadcast — nothing else needs to know when history is fetched, so it's a plain return value rather than
+        // a Clients.All.SendAsync.
+        public async Task<string> GetMappingHistoryAsync(int limit = 50)
+        {
+            try
+            {
+                var statistics = await MongoDbClient.Instance.GetMappingStatisticsAsync(limit);
+                return JsonConvert.SerializeObject(statistics, JsonSerializationHelper.NamingSerializerSettings);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Unable to get mapping history");
+                return JsonConvert.SerializeObject(new List<MappingStatistic>(), JsonSerializationHelper.NamingSerializerSettings);
+            }
+        }
+
         #endregion Public Methods
 
         #region Private Methods
@@ -111,20 +122,20 @@ namespace MusicServer.Hubs
             return JsonConvert.SerializeObject(library, JsonSerializationHelper.NamingSerializerSettings);
         }
 
+        // Just mutates MappingUpdate now — the Changed event (wired up once in MusicServer.Program.cs) pushes the
+        // broadcast itself, so this no longer needs to serialize/send anything directly. Kept as async Task so
+        // existing call sites don't need to change.
         private async Task SendMappingUpdate(string message = "", string error = "")
         {
-            var libraryManager = LibraryManager.Instance;
-            var mappingUpdate = libraryManager.MappingUpdate;
+            await Task.CompletedTask;
+
+            var mappingUpdate = LibraryManager.Instance.MappingUpdate;
 
             if (!string.IsNullOrWhiteSpace(message))
                 mappingUpdate.Message = message;
 
             if (!string.IsNullOrWhiteSpace(error))
                 mappingUpdate.Error = error;
-
-            var mappingUpdateJson = JsonConvert.SerializeObject(mappingUpdate, JsonSerializationHelper.NamingSerializerSettings);
-
-            await Clients.All.SendAsync("ReceiveMappingUpdate", mappingUpdateJson);
         }
 
         private async Task SaveLibraryResponseToFileAsync(string libraryResponse)
@@ -137,54 +148,94 @@ namespace MusicServer.Hubs
             }
             catch (Exception ex)
             {
-                _ = Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "SaveLibraryResponseToFileAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine($"Unable to save album to file: {ex.Message}");
+                _logger.LogError(ex, "Unable to save album to file");
             }
         }
 
-        private static async Task<string> GetLibraryResponseFromFileAsync()
+        // No longer static — it needs the injected _logger, which is instance state.
+        //
+        // This is the common path on every normal startup (LibraryManager.GetAlbums, the full disk/metadata scan,
+        // only runs when this throws - see GetLibraryAsync's catch block). It didn't used to set StartedAtUtc at
+        // all, which meant the live progress screen - gated on mappingUpdate.startedAtUtc - never rendered for a
+        // cache load, and MappingUpdateBroadcast never had a completed run to persist to history either. Now it
+        // resets/starts/completes MappingUpdate the same way GetAlbums does, tagged RunType.Cache so the live view
+        // and the run-history table can tell the two apart. In practice this takes roughly 10 seconds (deserializing
+        // every cached album JSON file), not the sub-second turnaround originally assumed - long enough to warrant
+        // the same once-a-second CPU/memory Timer GetAlbums uses, rather than a single one-shot reading.
+        private async Task<string> GetLibraryResponseFromFileAsync()
         {
+            var mappingUpdate = LibraryManager.Instance.MappingUpdate;
+
             try
             {
-                ConcurrentBag<Album> albums = [];
-                var filepaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
-                LibraryManager.Instance.MappingUpdate.DirectoryCount = filepaths.Count;
-                await Parallel.ForEachAsync(filepaths, async (file, token) =>
+                mappingUpdate.IsComplete = false;
+                mappingUpdate.Error = null;
+                mappingUpdate.RunType = MappingRunType.Cache;
+                mappingUpdate.MappedDirectories = 0;
+                mappingUpdate.StartedAtUtc = DateTime.UtcNow;
+
+                var process = Process.GetCurrentProcess();
+                var lastCpuTime = process.TotalProcessorTime;
+                var lastSampleAt = DateTime.UtcNow;
+
+                using (new Timer(_ =>
                 {
-                    await Task.CompletedTask;
-                    if (!Guid.TryParse(Path.GetFileNameWithoutExtension(file), out _)) return;
-                    var json = FileManager.Instance.Read(file);
-                    var album = JsonConvert.DeserializeObject<Album>(json, settings: JsonSerializationHelper.FileSerializerSettings);
-                    if (album == null)
-                        return;
-                    albums.Add(album);
+                    try
+                    {
+                        process.Refresh();
+                        var now = DateTime.UtcNow;
+                        var cpuTime = process.TotalProcessorTime;
 
-                    LibraryManager.Instance.MappingUpdate.Message = $"Mapped {album.Path}";
-                    LibraryManager.Instance.MappingUpdate.MappedDirectories = albums.Count;
+                        var cpuTimeDeltaMs = (cpuTime - lastCpuTime).TotalMilliseconds;
+                        var wallDeltaMs = (now - lastSampleAt).TotalMilliseconds;
+                        var cpuPercent = wallDeltaMs > 0 ? (cpuTimeDeltaMs / wallDeltaMs / Environment.ProcessorCount) * 100 : 0;
 
-                });
-                if (albums.Count == 0) throw new Exception("No matching files found in application directory");
+                        lastCpuTime = cpuTime;
+                        lastSampleAt = now;
 
-                return JsonConvert.SerializeObject(albums, JsonSerializationHelper.NamingSerializerSettings);
+                        mappingUpdate.CpuPercent = Math.Round(cpuPercent, 1);
+                        mappingUpdate.MemoryMb = Math.Round(process.WorkingSet64 / 1024.0 / 1024.0, 1);
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Unable to sample resource usage");
+                    }
+                }, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1)))
+                {
+                    ConcurrentBag<Album> albums = [];
+                    var filepaths = FileManager.Instance.GetFilePaths(Constants.JSON_FILE_PATTERN, Constants.GUUID_FILE_PATTERN);
+                    mappingUpdate.DirectoryCount = filepaths.Count;
+                    await Parallel.ForEachAsync(filepaths, async (file, token) =>
+                    {
+                        await Task.CompletedTask;
+                        if (!Guid.TryParse(Path.GetFileNameWithoutExtension(file), out _)) return;
+                        var json = FileManager.Instance.Read(file);
+                        var album = JsonConvert.DeserializeObject<Album>(json, settings: JsonSerializationHelper.FileSerializerSettings);
+                        if (album == null)
+                            return;
+                        albums.Add(album);
+
+                        mappingUpdate.Message = $"Mapped {album.Path}";
+                        mappingUpdate.MappedDirectories = albums.Count;
+
+                    });
+                    if (albums.Count == 0) throw new Exception("No matching files found in application directory");
+
+                    // This is the fast "Cache" path - deserializing each per-album JSON file straight off disk,
+                    // no mapping pass. Those files only get their IsFavourite/TimesPlayed fields refreshed when
+                    // that specific album is next mapped/refreshed, so without this overlay every normal library
+                    // load (this is the common path, see the comment above GetLibraryResponseFromFileAsync)
+                    // would show whatever favourite state was true the last time each album happened to be
+                    // mapped - not live trackUserData. See LibraryManager.ApplyLiveTrackUserDataAsync.
+                    await LibraryManager.Instance.ApplyLiveTrackUserDataAsync(albums);
+
+                    mappingUpdate.IsComplete = true;
+                    return JsonConvert.SerializeObject(albums, JsonSerializationHelper.NamingSerializerSettings);
+                }
             }
             catch (Exception ex)
             {
-                _ = Task.Run(async () => await ServerHttpClient.Instance.LogEntryAsync(new LogEntry
-                {
-                    Severity = Severity.Error,
-                    Source = "GetLibraryResponseFromFileAsync",
-                    Line = ex.Message,
-                    TimeStamp = DateTime.Now,
-                    Exception = ex
-                }));
-                Console.WriteLine($"Unable to get saved albums: {ex.Message}");
+                _logger.LogError(ex, "Unable to get saved albums");
                 throw;
             }
         }
