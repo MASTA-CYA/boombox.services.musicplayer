@@ -21,6 +21,10 @@
     <PackageReference Include="NAudio.Asio" Version="2.2.1" />
     <PackageReference Include="Serilog.AspNetCore" Version="10.0.0" />
     <PackageReference Include="Serilog.Sinks.File" Version="7.0.0" />
+    <!-- PerformanceCounter isn't in the .NET 8 shared framework anymore - needed by the /api/status endpoint
+         (Program.cs) for live CPU/IO stats, feeding the Homepage dashboard widget. Windows-only, same as the
+         ASIO/WASAPI code this app already depends on. -->
+    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="9.0.0" />
     <PackageReference Include="StackExchange.Redis" Version="2.10.1" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
     <PackageReference Include="System.Security.Permissions" Version="10.0.6" />

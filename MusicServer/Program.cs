@@ -1,5 +1,6 @@
 
 using Microsoft.AspNetCore.SignalR;
+using System.Diagnostics;
 using MusicPlayer.Common;
 using MusicPlayer.FileManagement;
 using MusicPlayer.LibraryManagement;
@@ -112,6 +113,37 @@ namespace MusicServer
                 app.MapHub<PlaylistHub>("/PlaylistHub");
                 app.MapHub<ServerHub>("/ServerHub");
                 app.MapHub<AutoScrollHub>("/AutoScrollHub");
+
+                // Feeds the Homepage dashboard's "Boombox Backend" tile (customapi widget, polled on its own
+                // refreshInterval) - see boombox-stats-implementation-plan.md Part B. Unauthenticated, same LAN
+                // trust boundary as everything else this dashboard reads. "Is it running" needs no extra logic:
+                // if the process is down, this can't respond at all, and the widget's connection error is
+                // functionally the down indicator - isRunning is only ever true in the response body.
+                //
+                // PerformanceCounter needs two samples to compute a rate - awaiting Task.Delay instead of the
+                // plan's Thread.Sleep so this doesn't tie up a thread-pool thread for 200ms per request. Matches
+                // by proc.ProcessName, not PID - the standard PerformanceCounter gotcha is a stale counter
+                // instance from a previous run getting suffixed ("MusicServer#1"), which would need matching by
+                // PID instead. Not expected to bite here, not hardened against it either.
+                app.MapGet("/api/status", async () =>
+                {
+                    var proc = Process.GetCurrentProcess();
+                    using var cpuCounter = new PerformanceCounter("Process", "% Processor Time", proc.ProcessName, true);
+                    cpuCounter.NextValue();
+                    await Task.Delay(200);
+                    var cpuPercent = cpuCounter.NextValue() / Environment.ProcessorCount;
+
+                    using var ioCounter = new PerformanceCounter("Process", "IO Data Bytes/sec", proc.ProcessName, true);
+                    var ioBytesPerSec = ioCounter.NextValue();
+
+                    return Results.Ok(new
+                    {
+                        isRunning = true,
+                        cpuPercent = Math.Round(cpuPercent, 1),
+                        ramMB = Math.Round(proc.WorkingSet64 / 1024.0 / 1024.0, 1),
+                        ioBytesPerSec = Math.Round(ioBytesPerSec, 0)
+                    });
+                });
 
                 app.Run();
             }
