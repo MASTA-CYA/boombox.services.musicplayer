@@ -69,6 +69,13 @@ correctly routed, and on nothing else on either machine claiming those same port
   Proxmox/Docker/LXC configuration, Windows Task Scheduler, and Tailscale's own network configuration, all
   external to what's checked in here. A fresh clone of either repo alone is not enough to stand this up; the
   infrastructure has to be recreated by hand following this doc.
+- **`MusicServer/appsettings.json` now explicitly sets `"Urls": "http://0.0.0.0:7280"`** (added `2026-09-26`, see
+  `KNOWN_ISSUES.md` #33) specifically so this one piece — which interfaces Kestrel actually binds to — doesn't
+  depend on an NSSM-side environment variable that isn't checked in anywhere. Before this fix, an NSSM
+  environment variable binding Kestrel to `localhost` only (rather than `0.0.0.0`) made `MusicServer`
+  unreachable via its own Tailscale IP even though the service was healthy and running — the same class of
+  externally-configured, undocumented setting this bullet already warns about, just one that happened to be
+  silently wrong for months rather than merely unrecorded.
 - `MusicServer/Program.cs`'s CORS policy currently allows only `http://localhost:9878` — flagged separately
   (not by this doc) as possibly stale or incorrect for the actual Tailscale-bridged topology described here;
   changing it needs confirmation of current intent before assuming the existing value is correct.
