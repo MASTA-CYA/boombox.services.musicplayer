@@ -1,12 +1,28 @@
-# Boombox — Music Player Backend
+<div align="center">
+  <img src="docs/images/boombox-logo.png" width="110" alt="Boombox logo" />
 
-The backend for **Boombox**, a personal self-hosted music player: gapless local playback over ASIO/WASAPI,
-a real-time SignalR API for a companion web UI, live lyrics, a 9-band parametric equalizer, and a library
-mapping pipeline that turns a folder of audio files into a browsable, metadata-rich collection.
+  # Boombox — Music Player Backend
 
-This is a solo, self-hosted project built to run one person's own music library on their own hardware — not a
-general-purpose product, and not accepting external contributions, but documented here in the interest of
-sharing how it's built.
+  ### *The music never stops*
+
+  Gapless local playback, a real-time SignalR API, and a library mapping pipeline — the .NET side of Boombox.
+
+  ![.NET 8](https://img.shields.io/badge/.NET-8-512BD4?logo=dotnet&logoColor=white)
+  ![.NET Framework 4.8](https://img.shields.io/badge/.NET%20Framework-4.8-512BD4?logo=dotnet&logoColor=white)
+  ![MongoDB](https://img.shields.io/badge/MongoDB-storage-47A248?logo=mongodb&logoColor=white)
+  ![Redis](https://img.shields.io/badge/Redis-cache-DC382D?logo=redis&logoColor=white)
+  ![Status](https://img.shields.io/badge/status-personal%20project-9b30ff)
+</div>
+
+<br/>
+
+> **Solo, self-hosted project.** Built to run one person's own music library on their own hardware — not a
+> general-purpose product, and not accepting external contributions, but documented here in the interest of
+> sharing how it's built.
+
+Gapless local playback over ASIO/WASAPI, a real-time SignalR API for a companion web UI, live lyrics, a 9-band
+parametric equalizer, and a library mapping pipeline that turns a folder of audio files into a browsable,
+metadata-rich collection.
 
 ## Projects
 
