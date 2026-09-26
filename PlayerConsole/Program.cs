@@ -1,45 +1,16 @@
-﻿using System.Reflection;
-
 namespace PlayerConsole
 {
+    // PlayerConsole is a throwaway console harness for exercising MusicPlayer/MusicServer code directly -
+    // testing and debugging playback-engine behavior, one-off data migrations, and other hard-to-reach paths
+    // without going through the full SignalR/MusicServer host. It references both MusicPlayer and MusicServer
+    // (see PlayerConsole.csproj) so either layer's code can be called from here ad hoc.
+    //
+    // Intentionally empty in this snapshot - whatever was being exercised here was scratch work tied to a
+    // specific local debugging session, not a reusable tool, so it's been cleared out rather than committed.
     internal class Program
     {
-        [STAThread]
-        static async Task Main(string[] args)
+        static void Main(string[] args)
         {
-            string infoVersion = Assembly.GetExecutingAssembly()
-            .GetCustomAttribute<AssemblyInformationalVersionAttribute>()?
-            .InformationalVersion;
-
-            Console.WriteLine($"Product Version: {infoVersion}");
-
-            //var jsonString = FileManager.Instance.Read("C:\\Users\\CYA\\AppData\\Local\\MongoDBCompass\\app-1.49.9\\music_server.playlists.json");
-            //var root = JsonConvert.DeserializeObject<List<Playlist>>(jsonString, settings: JsonSerializationHelper.FileSerializerSettings);
-            //var tracks = new List<PlaylistTrack>();
-
-            //foreach (var track in root[1].Tracks)
-            //{
-            //    track.Image = null;
-            //    tracks.Add(track);
-            //}
-            //root[1].Tracks = tracks;
-            //var fixedJson = JsonConvert.SerializeObject(root, JsonSerializationHelper.FileSerializerSettings);
-            //FileManager.Instance.Write("C:\\Users\\CYA\\AppData\\Local\\MongoDBCompass\\app-1.49.9\\test.json", fixedJson);
-
-            //var mediaInfo = new MediaInfoWrapper(@"C:\Users\CYA\Music\Gorillaz - Humanz (Japanese Edition)\01 - Interlude New World.flac");
-            //Console.WriteLine(mediaInfo.Tags.DiscNumber);
-            //var tagLibInfo = MediaFile.Read(@"C:\Users\CYA\Music\Gorillaz - Humanz (Japanese Edition)\01 - Interlude New World.flac");
-            //Console.WriteLine(tagLibInfo.Tag.DiscNumber);
-
-            Console.ReadKey();
-        }
-
-        private static void ExecuteOnPlayerThread(Action action)
-        {
-            var thread = new Thread(action.Invoke);
-            thread.SetApartmentState(ApartmentState.STA);
-            thread.Start();
-            thread.Join();
         }
     }
 }
